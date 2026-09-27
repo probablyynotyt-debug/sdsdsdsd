@@ -172,6 +172,29 @@ export function createPlayerHitProxy(
   return hitProxy;
 }
 
+export function createHumanoidHitProxy(humanoid: PlayerHumanoid) {
+  const characterProxy: any = {
+    Name: 'Player',
+    ClassName: 'Model',
+    Humanoid: humanoid,
+    humanoid: humanoid,
+    FindFirstChild: (n: string) => (n.toLowerCase() === 'humanoid' ? humanoid : null),
+    findFirstChild: (n: string) => (n.toLowerCase() === 'humanoid' ? humanoid : null),
+    FindFirstChildWhichIsA: (c: string) => (c.toLowerCase() === 'humanoid' ? humanoid : null),
+    findFirstChildWhichIsA: (c: string) => (c.toLowerCase() === 'humanoid' ? humanoid : null),
+  };
+
+  const hitProxy: any = {
+    Name: 'HumanoidRootPart',
+    ClassName: 'Part',
+    Parent: characterProxy,
+    parent: characterProxy,
+    Position: humanoid.Position,
+  };
+
+  return hitProxy;
+}
+
 export interface ScriptRuntimeContext {
   parts: Map<string, StudioPart>;
   meshes: Map<string, THREE.Mesh>;

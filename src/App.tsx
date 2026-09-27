@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Menu,
   Search,
@@ -19,8 +19,11 @@ import {
   Globe,
   Lock,
   ShoppingBag,
-  Trash2
+  Trash2,
+  Upload,
+  Image as ImageIcon
 } from 'lucide-react';
+import { uploadToCloudinary } from './services/cloudinary';
 import logoImg from './assets/logo.png';
 import AvatarViewer, { AvatarColors, DEFAULT_GREY } from './components/AvatarViewer';
 import BaseplateGame from './components/BaseplateGame';
@@ -195,6 +198,66 @@ export default function App() {
   // Equipped Pants Data URL (persisted in localStorage)
   const [pantsDataUrl, setPantsDataUrl] = useState<string | null>(getInitialPantsDataUrl);
 
+  // Game Icon Upload State
+  const gameIconFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [isUploadingGameIcon, setIsUploadingGameIcon] = useState<boolean>(false);
+
+  const handleUploadGameIcon = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !selectedExperience) return;
+    setIsUploadingGameIcon(true);
+    try {
+      let finalUrl = '';
+      try {
+        finalUrl = await uploadToCloudinary(file, {
+          preset: 'ml_default',
+          folder: 'boblox_game_icons',
+        });
+      } catch {
+        finalUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
+      const updatedExp: ExperienceData = {
+        ...selectedExperience,
+        iconUrl: finalUrl,
+        lastUpdated: Date.now(),
+      };
+      setSelectedExperience(updatedExp);
+      const updatedList = experiences.map((exp) => (exp.id === updatedExp.id ? updatedExp : exp));
+      setExperiences(updatedList);
+      saveExperiences(updatedList);
+      const creatorUser: UserProfile = currentUser || {
+        id: updatedExp.creatorId || 'builder',
+        username: updatedExp.creatorUsername || 'Builder',
+        email: 'builder@boblox.app',
+        displayName: 'Builder',
+        joinedDate: 'Joined Sep 2026',
+        createdAt: Date.now(),
+        lastActive: Date.now(),
+        avatarColors,
+        selectedFaceId,
+        shirtDataUrl,
+        pantsDataUrl,
+        selectedHairId,
+        hairColor,
+        friends: [],
+        friendRequests: [],
+        followers: [],
+        following: [],
+      };
+      await saveExperienceToFirestore(updatedExp, creatorUser);
+    } catch (err) {
+      console.error('Failed to upload game icon:', err);
+    } finally {
+      setIsUploadingGameIcon(false);
+      if (gameIconFileInputRef.current) gameIconFileInputRef.current.value = '';
+    }
+  };
+
   // Guarantee that logged-in user is saved to localStorage so reload always logs in straight away
   useEffect(() => {
     if (currentUser) {
@@ -281,21 +344,12 @@ export default function App() {
     }
   }, [currentView, selectedExperience?.name, viewingProfileUserId, currentUser?.username, currentUser?.id]);
 
-  // Tab visibility detection & tab close handler:
-  // Detects if not in the tab or tab closed: leaves in-game session and marks offline
+  // Tab visibility detection & tab close handler
   useEffect(() => {
     if (!currentUser?.id) return;
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        // Tab is hidden or user switched away
-        setCurrentView((prev) => (prev === 'playing' ? (selectedExperience ? 'game' : 'home') : prev));
-        saveUserAvatarToFirestore(currentUser.id, {
-          currentExperienceId: null,
-          currentExperienceName: null,
-          lastActive: 0, // marks offline
-        });
-      } else if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible') {
         // Returned to tab: mark online
         saveUserAvatarToFirestore(currentUser.id, {
           lastActive: Date.now(),
@@ -320,7 +374,7 @@ export default function App() {
       window.removeEventListener('beforeunload', handleUnload);
       window.removeEventListener('pagehide', handleUnload);
     };
-  }, [currentUser?.id, selectedExperience]);
+  }, [currentUser?.id]);
 
   const handleLogin = (user: UserProfile) => {
     setCurrentUser(user);
@@ -1195,10 +1249,18 @@ export default function App() {
                                 }}
                                 className="group flex flex-col text-left rounded-xl bg-[#16102a] hover:bg-[#1f163b] border border-purple-500/20 hover:border-purple-400/50 transition-all duration-200 overflow-hidden cursor-pointer shadow-sm hover:shadow-lg hover:shadow-purple-950/50 hover:-translate-y-1 focus:outline-none focus:ring-2 focus:ring-purple-400"
                               >
-                                <div className="aspect-[16/9] w-full bg-gradient-to-br from-[#251b47] to-[#120c24] flex flex-col items-center justify-center p-4 relative group-hover:scale-105 transition-transform duration-300">
-                                  <div className="w-12 h-12 rounded-xl bg-purple-900/40 border border-purple-500/30 flex items-center justify-center mb-1 group-hover:bg-purple-600/30 group-hover:border-purple-400 transition-colors shadow-inner">
-                                    <Boxes className="w-6 h-6 text-purple-300" />
-                                  </div>
+                                <div className="aspect-[16/9] w-full bg-gradient-to-br from-[#251b47] to-[#120c24] flex flex-col items-center justify-center relative overflow-hidden group-hover:scale-105 transition-transform duration-300">
+                                  {exp.iconUrl ? (
+                                    <img
+                                      src={exp.iconUrl}
+                                      alt={exp.name}
+                                      className="w-full h-full object-cover"
+                                    />
+                                  ) : (
+                                    <div className="w-12 h-12 rounded-xl bg-purple-900/40 border border-purple-500/30 flex items-center justify-center mb-1 group-hover:bg-purple-600/30 group-hover:border-purple-400 transition-colors shadow-inner">
+                                      <Boxes className="w-6 h-6 text-purple-300" />
+                                    </div>
+                                  )}
 
                                   {/* Staff Moderation Quick Delete on Card */}
                                   {isStaffUser(currentUser.username) && (
@@ -1292,7 +1354,27 @@ export default function App() {
                       </div>
 
                       <div className="rounded-2xl bg-[#17102d] border border-purple-500/20 overflow-hidden shadow-2xl">
-                        <div className="aspect-[16/9] w-full max-h-[460px] bg-gradient-to-br from-[#2a1d4f] via-[#1c1236] to-[#0f0920] flex flex-col items-center justify-center p-8 relative">
+                        <div className="aspect-[16/9] w-full max-h-[460px] bg-gradient-to-br from-[#2a1d4f] via-[#1c1236] to-[#0f0920] flex flex-col items-center justify-center p-8 relative overflow-hidden">
+                          {/* Background blurred game icon if available */}
+                          {selectedExperience.iconUrl && (
+                            <img
+                              src={selectedExperience.iconUrl}
+                              alt=""
+                              className="absolute inset-0 w-full h-full object-cover opacity-20 blur-md pointer-events-none"
+                            />
+                          )}
+
+                          {/* Game Icon Thumbnail */}
+                          {selectedExperience.iconUrl && (
+                            <div className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl overflow-hidden border-2 border-purple-500/40 shadow-2xl shadow-purple-600/30 mb-4 z-10">
+                              <img
+                                src={selectedExperience.iconUrl}
+                                alt={selectedExperience.name}
+                                className="w-full h-full object-cover"
+                              />
+                            </div>
+                          )}
+
                           <div className="text-center space-y-4 max-w-md z-10">
                             <h1 className="text-3xl sm:text-4xl md:text-5xl font-display font-black text-white tracking-tight drop-shadow-md">
                               {selectedExperience.name}
@@ -1302,7 +1384,7 @@ export default function App() {
                             </p>
                           </div>
 
-                          <div className="pt-6 z-10 flex items-center gap-3">
+                          <div className="pt-6 z-10 flex flex-wrap items-center justify-center gap-3">
                             <button
                               onClick={handlePlayClick}
                               className="px-10 py-4 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-display font-black text-lg tracking-wide shadow-xl shadow-purple-900/60 hover:shadow-purple-600/40 hover:scale-105 active:scale-95 transition-all flex items-center gap-3 cursor-pointer group"
@@ -1320,6 +1402,28 @@ export default function App() {
                               <SlidersHorizontal className="w-4 h-4 text-purple-400" />
                               <span>Edit in Studio</span>
                             </button>
+
+                            {/* Direct Game Icon Upload Button */}
+                            {(isStaffUser(currentUser.username) || isOwnerUser(currentUser.username) || selectedExperience.creatorId === currentUser.id) && (
+                              <button
+                                onClick={() => gameIconFileInputRef.current?.click()}
+                                disabled={isUploadingGameIcon}
+                                className="px-4 py-4 rounded-2xl bg-purple-950/60 hover:bg-purple-900/80 border border-purple-500/30 text-purple-300 hover:text-white text-xs font-bold transition-all flex items-center gap-2 cursor-pointer"
+                                title="Upload Custom Game Icon"
+                              >
+                                <Upload className="w-4 h-4 text-purple-400" />
+                                <span>{isUploadingGameIcon ? 'Uploading...' : 'Upload Icon'}</span>
+                              </button>
+                            )}
+
+                            {/* Hidden file input */}
+                            <input
+                              ref={gameIconFileInputRef}
+                              type="file"
+                              accept="image/png, image/jpeg, image/webp"
+                              onChange={handleUploadGameIcon}
+                              className="hidden"
+                            />
                           </div>
                         </div>
 

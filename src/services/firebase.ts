@@ -114,6 +114,7 @@ export interface UserProfile {
 // Live In-Game Player Presence
 export interface LivePlayerPresence {
   userId: string;
+  sessionId?: string;
   username: string;
   position: [number, number, number];
   rotationY: number;
@@ -547,18 +548,28 @@ export function subscribeExperienceById(expId: string, callback: (exp: Experienc
 // -------------------------------------------------------------
 // REAL-TIME MULTIPLAYER IN-GAME PRESENCE & CHAT
 // -------------------------------------------------------------
+// Live In-Game Multiplayer Presence
+// -------------------------------------------------------------
 export async function joinGamePresence(
   experienceId: string,
   user: UserProfile,
-  initialPos: [number, number, number] = [0, 0, 0]
+  initialPos: [number, number, number] = [0, 0, 0],
+  sessionId?: string
 ) {
-  const playerDocRef = doc(db, 'active_games', experienceId, 'players', user.id);
+  const presenceId = sessionId || `sess_${user.id}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const playerDocRef = doc(db, 'active_games', experienceId, 'players', presenceId);
+  const cleanUsername = (user.username && user.username !== 'undefined' && user.username.trim() !== '')
+    ? user.username.trim()
+    : (user.displayName || 'Player');
+
   const presence: LivePlayerPresence = {
     userId: user.id,
-    username: user.username,
+    sessionId: presenceId,
+    username: cleanUsername,
     position: initialPos,
     rotationY: 0,
     isMoving: false,
+    isJumping: false,
     avatarColors: user.avatarColors || {
       head: '#8A929E',
       torso: '#8A929E',
@@ -575,6 +586,7 @@ export async function joinGamePresence(
     hairColor: user.hairColor || '#4a2e1b',
     customHairObj: user.customHairObj || null,
     currentChat: null,
+    isDead: false,
     lastPing: Date.now(),
   };
 
@@ -584,18 +596,18 @@ export async function joinGamePresence(
     await updateDoc(doc(db, 'users', user.id), {
       currentExperienceId: experienceId,
       lastActive: Date.now(),
-    });
+    }).catch(() => {});
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `active_games/${experienceId}/players/${user.id}`);
+    handleFirestoreError(err, OperationType.WRITE, `active_games/${experienceId}/players/${presenceId}`);
   }
 }
 
 export async function updateGamePresence(
   experienceId: string,
-  userId: string,
+  presenceId: string,
   updates: Partial<LivePlayerPresence>
 ) {
-  const playerDocRef = doc(db, 'active_games', experienceId, 'players', userId);
+  const playerDocRef = doc(db, 'active_games', experienceId, 'players', presenceId);
   try {
     await updateDoc(playerDocRef, {
       ...updates,
@@ -606,15 +618,17 @@ export async function updateGamePresence(
   }
 }
 
-export async function leaveGamePresence(experienceId: string, userId: string) {
-  const playerDocRef = doc(db, 'active_games', experienceId, 'players', userId);
+export async function leaveGamePresence(experienceId: string, presenceId: string, userId?: string) {
+  const playerDocRef = doc(db, 'active_games', experienceId, 'players', presenceId);
   try {
     await deleteDoc(playerDocRef);
-    await updateDoc(doc(db, 'users', userId), {
-      currentExperienceId: null,
-      currentExperienceName: null,
-      lastActive: Date.now(),
-    });
+    if (userId) {
+      await updateDoc(doc(db, 'users', userId), {
+        currentExperienceId: null,
+        currentExperienceName: null,
+        lastActive: Date.now(),
+      }).catch(() => {});
+    }
   } catch {
     // ignore
   }
@@ -622,7 +636,7 @@ export async function leaveGamePresence(experienceId: string, userId: string) {
 
 export function subscribeGamePlayers(
   experienceId: string,
-  currentUserId: string,
+  currentPresenceId: string,
   callback: (players: LivePlayerPresence[]) => void
 ) {
   const playersCol = collection(db, 'active_games', experienceId, 'players');
@@ -633,9 +647,14 @@ export function subscribeGamePlayers(
       const players: LivePlayerPresence[] = [];
       snap.docs.forEach((d) => {
         const p = d.data() as LivePlayerPresence;
-        // Ignore players whose heartbeat is older than 25 seconds (stale sessions)
-        if (p.userId !== currentUserId && now - p.lastPing < 25000) {
-          players.push(p);
+        const pId = p.sessionId || d.id;
+        // Ignore own player session, and stale players (> 30s since last heartbeat)
+        if (pId !== currentPresenceId && now - (p.lastPing || 0) < 30000) {
+          players.push({
+            ...p,
+            sessionId: pId,
+            username: (p.username && p.username !== 'undefined' && p.username.trim() !== '') ? p.username.trim() : 'Player',
+          });
         }
       });
       callback(players);

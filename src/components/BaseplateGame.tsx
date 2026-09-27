@@ -16,7 +16,9 @@ import {
   ChevronLeft,
   Gamepad,
   Smartphone,
-  ArrowUp
+  ArrowUp,
+  Boxes,
+  Heart
 } from 'lucide-react';
 import logoImg from '../assets/logo.png';
 import { createFaceMesh, getFaceTexture } from '../utils/faceTexture';
@@ -24,10 +26,11 @@ import { attachShirtToLimbs } from '../utils/shirtTexture';
 import { attachPantsToLimbs } from '../utils/pantsTexture';
 import { createAccessoryMesh } from '../utils/accessoryMesh';
 import { createHairMesh, createHairMeshAsync } from '../utils/hairMesh';
-import { ExperienceData, StudioPart } from '../types/experience';
+import { ExperienceData, StudioPart, StudioScript } from '../types/experience';
 import { applyTextureProperties } from '../utils/textureMapping';
 import { RagdollShatterManager } from '../utils/ragdollShatter';
 import { gameAudio } from '../utils/gameAudio';
+import { LuaScriptRunner, PlayerHumanoid, ScriptLogMessage, createHumanoidHitProxy } from '../utils/luaScriptEngine';
 import {
   UserProfile,
   LivePlayerPresence,
@@ -380,10 +383,15 @@ export default function BaseplateGame({
   // Active Experience ID
   const expId = experience?.id || 'classic-baseplate-sandbox';
 
+  // Stable Guest ID if not logged in
+  const guestIdRef = useRef<string>(
+    'guest-' + Math.random().toString(36).substring(2, 8)
+  );
+
   // Resolved user identity
   const effectiveUser: UserProfile = currentUser || {
-    id: 'guest-' + Math.random().toString(36).substring(2, 8),
-    username: 'Guest',
+    id: guestIdRef.current,
+    username: 'Guest_' + guestIdRef.current.slice(-4),
     email: 'guest@boblox.app',
     displayName: 'Guest Player',
     joinedDate: 'Joined Sep 2026',
@@ -395,11 +403,76 @@ export default function BaseplateGame({
     pantsDataUrl,
     selectedHairId,
     hairColor,
+    customHairObj,
+    selectedAccessoryId,
     friends: [],
     friendRequests: [],
     followers: [],
     following: [],
   };
+
+  // Unique session ID for this browser tab/session so multi-tab and multi-window testing NEVER collides!
+  const sessionIdRef = useRef<string>(
+    `sess_${effectiveUser.id}_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`
+  );
+
+  // Roblox-Style 3-Second Joining Screen State
+  const [isJoining, setIsJoining] = useState<boolean>(true);
+  const [joiningFadeOut, setJoiningFadeOut] = useState<boolean>(false);
+  const [joiningStage, setJoiningStage] = useState<string>('Requesting server instance...');
+  const [joiningProgress, setJoiningProgress] = useState<number>(15);
+  const [joiningDots, setJoiningDots] = useState<string>('.');
+
+  useEffect(() => {
+    const dotsTimer = setInterval(() => {
+      setJoiningDots((prev) => (prev.length >= 3 ? '.' : prev + '.'));
+    }, 350);
+
+    const t1 = setTimeout(() => {
+      setJoiningProgress(45);
+      setJoiningStage('Loading character & assets...');
+    }, 800);
+
+    const t2 = setTimeout(() => {
+      setJoiningProgress(75);
+      setJoiningStage('Synchronizing multiplayer server...');
+    }, 1600);
+
+    const t3 = setTimeout(() => {
+      setJoiningProgress(100);
+      setJoiningStage('Teleporting avatar to spawn pad...');
+    }, 2400);
+
+    const t4 = setTimeout(() => {
+      setJoiningFadeOut(true);
+    }, 2850);
+
+    const t5 = setTimeout(() => {
+      setIsJoining(false);
+    }, 3400);
+
+    return () => {
+      clearInterval(dotsTimer);
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+      clearTimeout(t4);
+      clearTimeout(t5);
+    };
+  }, []);
+
+  // Lua Script Engine & Humanoid State
+  const luaRunnerRef = useRef<LuaScriptRunner>(new LuaScriptRunner());
+  const partMeshesMapRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  const [playerHealth, setPlayerHealth] = useState<number>(100);
+  const playerHealthRef = useRef<number>(100);
+  playerHealthRef.current = playerHealth;
+  const [playerWalkSpeed, setPlayerWalkSpeed] = useState<number>(16);
+  const playerWalkSpeedRef = useRef<number>(16);
+  playerWalkSpeedRef.current = playerWalkSpeed;
+  const [playerJumpPower, setPlayerJumpPower] = useState<number>(50);
+  const playerJumpPowerRef = useRef<number>(50);
+  playerJumpPowerRef.current = playerJumpPower;
 
   // Pause menu state
   const [isPaused, setIsPaused] = useState(false);
@@ -475,6 +548,7 @@ export default function BaseplateGame({
   const playerVelocityYRef = useRef<number>(0);
   const isGroundedRef = useRef<boolean>(true);
   const playerHeadingRef = useRef<number>(0);
+  const isMovingRef = useRef<boolean>(false);
 
   // Local chat bubble ref
   const localChatBubbleRef = useRef<THREE.Sprite | null>(null);
@@ -495,32 +569,173 @@ export default function BaseplateGame({
   const isDraggingRef = useRef<boolean>(false);
   const prevMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
-  // Unified Jump Action (Keyboard, Mobile Touch Button, Xbox A button)
-  const triggerJump = () => {
-    if (isGroundedRef.current) {
-      playerVelocityYRef.current = 15.5;
-      isGroundedRef.current = false;
-      gameAudio.playJumpSound();
-      // Immediately broadcast jumping state to Firestore
-      updateGamePresence(expId, effectiveUser.id, {
-        position: [
-          Math.round(playerPosRef.current.x * 10) / 10,
-          Math.round((playerPosRef.current.y + 1.2) * 10) / 10,
-          Math.round(playerPosRef.current.z * 10) / 10,
-        ],
-        rotationY: Math.round(playerHeadingRef.current * 100) / 100,
-        isMoving: true,
-        isJumping: true,
-      });
-    }
-  };
-
   const sceneRef = useRef<THREE.Scene | null>(null);
   const ragdollManagerRef = useRef<RagdollShatterManager>(new RagdollShatterManager());
   const remoteRagdollsRef = useRef<Map<string, RagdollShatterManager>>(new Map());
   const remotePrevDeadRef = useRef<Map<string, boolean>>(new Map());
   const lastBroadcastMovingRef = useRef<boolean>(false);
   const lastBroadcastJumpingRef = useRef<boolean>(false);
+
+  // Local BroadcastChannel for instant zero-latency multi-tab sync on the same computer
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof BroadcastChannel === 'undefined') return;
+    try {
+      const bc = new BroadcastChannel(`boblox_mp_${expId}`);
+      broadcastChannelRef.current = bc;
+      bc.onmessage = (event) => {
+        const data = event.data;
+        if (!data || data.sessionId === sessionIdRef.current) return;
+        if (data.type === 'presence_update' || data.type === 'player_hello') {
+          const incoming: LivePlayerPresence = data.presence;
+          if (incoming) {
+            setRemotePlayers((prev) => {
+              const map = new Map<string, LivePlayerPresence>();
+              prev.forEach((p) => map.set(p.sessionId || p.userId, p));
+              map.set(incoming.sessionId || incoming.userId, incoming);
+              const next = Array.from(map.values()).filter((p) => (p.sessionId || p.userId) !== sessionIdRef.current);
+              remotePlayersRef.current = next;
+              return next;
+            });
+
+            // If another tab announced itself via hello, reply with our own presence so both tabs see each other immediately!
+            if (data.type === 'player_hello') {
+              broadcastLocalPresence();
+            }
+          }
+        } else if (data.type === 'player_leave') {
+          setRemotePlayers((prev) => {
+            const next = prev.filter((p) => (p.sessionId || p.userId) !== data.sessionId);
+            remotePlayersRef.current = next;
+            return next;
+          });
+        }
+      };
+
+      // Announce presence immediately to all local browser tabs
+      setTimeout(() => {
+        broadcastLocalPresence();
+      }, 100);
+
+      return () => {
+        bc.postMessage({ type: 'player_leave', sessionId: sessionIdRef.current });
+        bc.close();
+        broadcastChannelRef.current = null;
+      };
+    } catch {
+      // BroadcastChannel optional fallback
+    }
+  }, [expId]);
+
+  // Dual Broadcast (BroadcastChannel for 0ms same-machine sync + Firestore for global sync)
+  const broadcastLocalPresence = (updates: Partial<LivePlayerPresence> = {}) => {
+    const cleanUsername = (effectiveUser.username && effectiveUser.username !== 'undefined' && effectiveUser.username.trim() !== '')
+      ? effectiveUser.username.trim()
+      : 'Player';
+
+    const fullPresence: LivePlayerPresence = {
+      userId: effectiveUser.id,
+      sessionId: sessionIdRef.current,
+      username: cleanUsername,
+      position: [
+        Math.round(playerPosRef.current.x * 10) / 10,
+        Math.round(playerPosRef.current.y * 10) / 10,
+        Math.round(playerPosRef.current.z * 10) / 10,
+      ],
+      rotationY: Math.round(playerHeadingRef.current * 100) / 100,
+      isMoving: isMovingRef.current,
+      isJumping: !isGroundedRef.current,
+      avatarColors,
+      selectedFaceId,
+      shirtDataUrl,
+      pantsDataUrl,
+      selectedHairId,
+      hairColor,
+      customHairObj,
+      selectedAccessoryId,
+      isDead: isDeadRef.current,
+      lastPing: Date.now(),
+      ...updates,
+    };
+
+    // 1. BroadcastChannel (0ms local tabs)
+    if (broadcastChannelRef.current) {
+      try {
+        broadcastChannelRef.current.postMessage({
+          type: 'presence_update',
+          sessionId: sessionIdRef.current,
+          presence: fullPresence,
+        });
+      } catch {}
+    }
+
+    // 2. Firestore Cloud Presence
+    updateGamePresence(expId, sessionIdRef.current, updates);
+  };
+
+  // Humanoid Proxy for Lua scripts (Health, WalkSpeed, JumpPower, TakeDamage, Die)
+  const humanoidProxyRef = useRef<PlayerHumanoid>({
+    get Health() {
+      return playerHealthRef.current;
+    },
+    set Health(val: number) {
+      const next = Math.max(0, Number(val) || 0);
+      playerHealthRef.current = next;
+      setPlayerHealth(next);
+      if (next <= 0) triggerPlayerDeath();
+    },
+    get MaxHealth() {
+      return 100;
+    },
+    get WalkSpeed() {
+      return playerWalkSpeedRef.current;
+    },
+    set WalkSpeed(val: number) {
+      const spd = Math.max(0, Number(val) || 16);
+      playerWalkSpeedRef.current = spd;
+      setPlayerWalkSpeed(spd);
+    },
+    get JumpPower() {
+      return playerJumpPowerRef.current;
+    },
+    set JumpPower(val: number) {
+      const jp = Math.max(0, Number(val) || 50);
+      playerJumpPowerRef.current = jp;
+      setPlayerJumpPower(jp);
+    },
+    Position: playerPosRef.current,
+    TakeDamage: (dmg: number) => {
+      const next = Math.max(0, playerHealthRef.current - Number(dmg));
+      playerHealthRef.current = next;
+      setPlayerHealth(next);
+      if (next <= 0) triggerPlayerDeath();
+    },
+    Die: () => triggerPlayerDeath(),
+  });
+
+  // Unified Jump Action (Keyboard, Mobile Touch Button, Xbox A button)
+  const triggerJump = () => {
+    if (isGroundedRef.current && !isDeadRef.current) {
+      const jumpPower = playerJumpPowerRef.current || 50;
+      const jumpVelocity = (jumpPower / 50) * 15.5;
+      playerVelocityYRef.current = jumpVelocity;
+      isGroundedRef.current = false;
+      gameAudio.playJumpSound();
+
+      // Immediately broadcast jumping state
+      broadcastLocalPresence({
+        position: [
+          Math.round(playerPosRef.current.x * 10) / 10,
+          Math.round((playerPosRef.current.y + 1.2) * 10) / 10,
+          Math.round(playerPosRef.current.z * 10) / 10,
+        ],
+        rotationY: Math.round(playerHeadingRef.current * 100) / 100,
+        isMoving: isMovingRef.current,
+        isJumping: true,
+      });
+    }
+  };
 
   const triggerPlayerDeath = () => {
     if (isDeadRef.current) return;
@@ -531,8 +746,8 @@ export default function BaseplateGame({
     // Play classic Roblox OOF / Death audio
     gameAudio.playDeathSound();
 
-    // Broadcast death state to Firestore so all remote players see the ragdoll shatter in real-time!
-    updateGamePresence(expId, effectiveUser.id, {
+    // Broadcast death state to all peers and Firestore so all players see the ragdoll shatter in real-time!
+    broadcastLocalPresence({
       isDead: true,
       isMoving: false,
       isJumping: false,
@@ -573,6 +788,14 @@ export default function BaseplateGame({
         setIsDead(false);
         isDeadRef.current = false;
 
+        // Reset player health and stats on respawn
+        setPlayerHealth(100);
+        playerHealthRef.current = 100;
+        setPlayerWalkSpeed(16);
+        playerWalkSpeedRef.current = 16;
+        setPlayerJumpPower(50);
+        playerJumpPowerRef.current = 50;
+
         const spawnPart = experience?.parts?.find((p) => p.name.toLowerCase().includes('spawn'));
         const spawnPos: [number, number, number] = spawnPart
           ? [spawnPart.position[0], spawnPart.position[1] + spawnPart.size[1] / 2 + 0.1, spawnPart.position[2]]
@@ -587,8 +810,8 @@ export default function BaseplateGame({
           limbsRef.current.characterGroup.position.set(spawnPos[0], spawnPos[1], spawnPos[2]);
         }
 
-        // Broadcast alive/respawn state to Firestore
-        updateGamePresence(expId, effectiveUser.id, {
+        // Broadcast alive/respawn state to all players
+        broadcastLocalPresence({
           isDead: false,
           position: spawnPos,
           isMoving: false,
@@ -648,15 +871,15 @@ export default function BaseplateGame({
     const spawnPart = experience?.parts?.find((p) => p.name.toLowerCase().includes('spawn'));
     const initialPos: [number, number, number] = spawnPart
       ? [spawnPart.position[0], spawnPart.position[1] + spawnPart.size[1] / 2 + 0.1, spawnPart.position[2]]
-      : [0, 0, 0];
+      : [0, 0.1, 0];
 
     playerPosRef.current.set(initialPos[0], initialPos[1], initialPos[2]);
 
-    joinGamePresence(expId, effectiveUser, initialPos);
+    joinGamePresence(expId, effectiveUser, initialPos, sessionIdRef.current);
 
     // Heartbeat every 8s
     const heartbeat = setInterval(() => {
-      updateGamePresence(expId, effectiveUser.id, {
+      updateGamePresence(expId, sessionIdRef.current, {
         position: [
           Math.round(playerPosRef.current.x * 10) / 10,
           Math.round(playerPosRef.current.y * 10) / 10,
@@ -667,26 +890,20 @@ export default function BaseplateGame({
       });
     }, 8000);
 
-    // Tab visibility & close listeners: if tab closes or user navigates away, leave game immediately
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        leaveGamePresence(expId, effectiveUser.id);
-        onLeaveGame();
+    const handleBeforeUnload = () => {
+      leaveGamePresence(expId, sessionIdRef.current, effectiveUser.id);
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'player_leave', sessionId: sessionIdRef.current });
       }
     };
 
-    const handleBeforeUnload = () => {
-      leaveGamePresence(expId, effectiveUser.id);
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('pagehide', handleBeforeUnload);
 
     return () => {
       clearInterval(heartbeat);
-      leaveGamePresence(expId, effectiveUser.id);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      leaveGamePresence(expId, sessionIdRef.current, effectiveUser.id);
+      luaRunnerRef.current.stop();
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('pagehide', handleBeforeUnload);
     };
@@ -694,12 +911,12 @@ export default function BaseplateGame({
 
   // 2. Subscribe to remote players in this game
   useEffect(() => {
-    const unsub = subscribeGamePlayers(expId, effectiveUser.id, (players) => {
+    const unsub = subscribeGamePlayers(expId, sessionIdRef.current, (players) => {
       remotePlayersRef.current = players;
       setRemotePlayers(players);
     });
     return () => unsub();
-  }, [expId, effectiveUser.id]);
+  }, [expId]);
 
   // 3. Subscribe to real-time chat messages
   useEffect(() => {
@@ -844,7 +1061,15 @@ export default function BaseplateGame({
     let currentPartsList: StudioPart[] = experience?.parts || [];
     const texLoader = new THREE.TextureLoader();
 
-    const syncParts = (newParts: StudioPart[]) => {
+    let lastExperienceScripts: StudioScript[] = experience?.scripts || [];
+
+    const syncParts = (newParts?: StudioPart[], newScripts?: StudioScript[]) => {
+      luaRunnerRef.current.stop();
+
+      if (newScripts) {
+        lastExperienceScripts = newScripts;
+      }
+
       // Clear previous parts
       while (partsGroup.children.length > 0) {
         const obj = partsGroup.children[0] as THREE.Mesh;
@@ -859,10 +1084,12 @@ export default function BaseplateGame({
 
       currentPartMeshes = [];
       currentPartsList = newParts || [];
+      const newMeshesMap = new Map<string, THREE.Mesh>();
 
       currentPartsList.forEach((part) => {
         const mesh = buildPartMesh(part, texLoader);
         partsGroup.add(mesh);
+        newMeshesMap.set(part.id, mesh);
         currentPartMeshes.push({
           part,
           mesh,
@@ -870,15 +1097,64 @@ export default function BaseplateGame({
           currentY: part.position[1],
         });
       });
+      partMeshesMapRef.current = newMeshesMap;
+
+      // Start all scripts (ServerScriptService scripts + part scripts)
+      const allScripts: StudioScript[] = [...(lastExperienceScripts || [])];
+      currentPartsList.forEach((p) => {
+        if (p.scripts && p.scripts.length > 0) {
+          allScripts.push(...p.scripts);
+        }
+      });
+
+      if (allScripts.length > 0) {
+        luaRunnerRef.current.start(
+          allScripts,
+          currentPartsList,
+          newMeshesMap,
+          humanoidProxyRef.current,
+          () => {},
+          () => triggerPlayerDeath(),
+          (partId, updated) => {
+            const entry = currentPartMeshes.find((m) => m.part.id === partId);
+            if (entry) {
+              if (updated.position) {
+                entry.mesh.position.set(updated.position[0], updated.position[1], updated.position[2]);
+              }
+              if (updated.color && entry.mesh.material) {
+                if (Array.isArray(entry.mesh.material)) {
+                  entry.mesh.material.forEach((mat) => {
+                    if ('color' in mat) (mat as any).color.set(updated.color!);
+                  });
+                } else if ('color' in entry.mesh.material) {
+                  (entry.mesh.material as any).color.set(updated.color);
+                }
+              }
+              if (updated.transparency !== undefined && entry.mesh.material) {
+                const trans = Math.max(0, Math.min(1, updated.transparency));
+                if (Array.isArray(entry.mesh.material)) {
+                  entry.mesh.material.forEach((mat) => {
+                    mat.transparent = trans > 0;
+                    mat.opacity = 1 - trans;
+                  });
+                } else {
+                  entry.mesh.material.transparent = trans > 0;
+                  entry.mesh.material.opacity = 1 - trans;
+                }
+              }
+            }
+          }
+        );
+      }
     };
 
     // Initial build from experience prop if present
-    syncParts(experience?.parts || []);
+    syncParts(experience?.parts || [], experience?.scripts || []);
 
     // Live subscription to experience parts in Firestore so any device/tab sees parts instantly
     const unsubExp = subscribeExperienceById(expId, (liveExp) => {
-      if (liveExp && liveExp.parts && liveExp.parts.length > 0) {
-        syncParts(liveExp.parts);
+      if (liveExp) {
+        syncParts(liveExp.parts || [], liveExp.scripts || []);
       }
     });
 
@@ -1203,6 +1479,7 @@ export default function BaseplateGame({
         if (keys['a'] || keys['arrowleft']) inputRight -= 1;
 
         const isMoving = Math.abs(inputForward) > 0.05 || Math.abs(inputRight) > 0.05;
+        isMovingRef.current = isMoving;
 
         if (isMoving) {
           const len = Math.hypot(inputForward, inputRight);
@@ -1211,7 +1488,7 @@ export default function BaseplateGame({
           const moveDirX = normF * forwardX + normR * rightX;
           const moveDirZ = normF * forwardZ + normR * rightZ;
 
-          const moveSpeed = 16;
+          const moveSpeed = playerWalkSpeedRef.current || 16;
           const targetX = playerPosRef.current.x + moveDirX * moveSpeed * delta;
           const targetZ = playerPosRef.current.z + moveDirZ * moveSpeed * delta;
 
@@ -1308,21 +1585,28 @@ export default function BaseplateGame({
           triggerPlayerDeath();
         }
 
-        // Kill Brick Touch Detection
+        // Touch Detection & Lua .Touched Event
         if (!isDeadRef.current) {
           currentPartsList.forEach((part) => {
-            const isKill =
-              part.name.toLowerCase().includes('kill') ||
-              part.name.toLowerCase().includes('lava') ||
-              part.name.toLowerCase().includes('acid') ||
-              ((part.color === '#ff0000' || part.color === '#ff2222' || part.color === '#dc2626' || part.color === '#ef4444') && part.material === 'Neon') ||
-              (part.scripts && part.scripts.some((s) => s.code.toLowerCase().includes('health = 0') || s.code.toLowerCase().includes('takedamage')));
+            const dx = Math.abs(playerPosRef.current.x - part.position[0]);
+            const dy = Math.abs(playerPosRef.current.y + 2.5 - part.position[1]);
+            const dz = Math.abs(playerPosRef.current.z - part.position[2]);
+            const isTouching =
+              dx <= part.size[0] / 2 + 0.9 &&
+              dy <= part.size[1] / 2 + 2.6 &&
+              dz <= part.size[2] / 2 + 0.9;
 
-            if (isKill) {
-              const dx = Math.abs(playerPosRef.current.x - part.position[0]);
-              const dy = Math.abs(playerPosRef.current.y + 2.5 - part.position[1]);
-              const dz = Math.abs(playerPosRef.current.z - part.position[2]);
-              if (dx <= part.size[0] / 2 + 0.8 && dy <= part.size[1] / 2 + 2.5 && dz <= part.size[2] / 2 + 0.8) {
+            if (isTouching) {
+              const hitProxy = createHumanoidHitProxy(humanoidProxyRef.current);
+              luaRunnerRef.current.triggerTouched(part.id, hitProxy);
+
+              const isKill =
+                part.name.toLowerCase().includes('kill') ||
+                part.name.toLowerCase().includes('lava') ||
+                part.name.toLowerCase().includes('acid') ||
+                ((part.color === '#ff0000' || part.color === '#ff2222' || part.color === '#dc2626' || part.color === '#ef4444') && part.material === 'Neon');
+
+              if (isKill) {
                 triggerPlayerDeath();
               }
             }
@@ -1388,7 +1672,7 @@ export default function BaseplateGame({
         camera.position.set(camX, Math.max(0.5, camY), camZ);
         camera.lookAt(targetLookAt);
 
-        // Periodically broadcast local player movement to Firestore (every ~100ms when moving/jumping)
+        // Periodically broadcast local player movement (every ~80ms when moving/jumping)
         presenceThrottleTime += delta;
         const currentIsJumping = !isGroundedRef.current;
         const movementStateChanged =
@@ -1396,12 +1680,12 @@ export default function BaseplateGame({
 
         if (
           (isMoving || currentIsJumping || movementStateChanged) &&
-          (presenceThrottleTime > 0.1 || movementStateChanged)
+          (presenceThrottleTime > 0.08 || movementStateChanged)
         ) {
           presenceThrottleTime = 0;
           lastBroadcastMovingRef.current = isMoving;
           lastBroadcastJumpingRef.current = currentIsJumping;
-          updateGamePresence(expId, effectiveUser.id, {
+          broadcastLocalPresence({
             position: [
               Math.round(playerPosRef.current.x * 10) / 10,
               Math.round(playerPosRef.current.y * 10) / 10,
@@ -1419,7 +1703,7 @@ export default function BaseplateGame({
       // ==========================================
       const currentRemoteMap = remotePlayerMeshesRef.current;
       const activeRemotePlayers = remotePlayersRef.current;
-      const activeIds = new Set(activeRemotePlayers.map((p) => p.userId));
+      const activeIds = new Set(activeRemotePlayers.map((p) => p.sessionId || p.userId));
 
       // Remove disconnected players
       currentRemoteMap.forEach((entry, uid) => {
@@ -1439,7 +1723,8 @@ export default function BaseplateGame({
 
       // Update or create remote player meshes
       activeRemotePlayers.forEach((rp) => {
-        let entry = currentRemoteMap.get(rp.userId);
+        const rpKey = rp.sessionId || rp.userId;
+        let entry = currentRemoteMap.get(rpKey);
 
         if (!entry) {
           // Create new 3D character for remote player with identical R6 proportions and head!
@@ -1480,21 +1765,21 @@ export default function BaseplateGame({
             detachShirt: rChar.detachShirt,
             detachPants: rChar.detachPants,
           };
-          currentRemoteMap.set(rp.userId, entry);
+          currentRemoteMap.set(rpKey, entry);
         }
 
         // Handle remote player death shattering in real-time
-        const wasDead = remotePrevDeadRef.current.get(rp.userId) || false;
+        const wasDead = remotePrevDeadRef.current.get(rpKey) || false;
         const isNowDead = !!rp.isDead;
 
         if (isNowDead) {
           entry.group.visible = false;
           if (!wasDead) {
-            remotePrevDeadRef.current.set(rp.userId, true);
-            let ragdoll = remoteRagdollsRef.current.get(rp.userId);
+            remotePrevDeadRef.current.set(rpKey, true);
+            let ragdoll = remoteRagdollsRef.current.get(rpKey);
             if (!ragdoll) {
               ragdoll = new RagdollShatterManager();
-              remoteRagdollsRef.current.set(rp.userId, ragdoll);
+              remoteRagdollsRef.current.set(rpKey, ragdoll);
             }
             ragdoll.shatterCharacter(
               entry.group.position,
@@ -1520,8 +1805,8 @@ export default function BaseplateGame({
           }
         } else {
           if (wasDead) {
-            remotePrevDeadRef.current.set(rp.userId, false);
-            const ragdoll = remoteRagdollsRef.current.get(rp.userId);
+            remotePrevDeadRef.current.set(rpKey, false);
+            const ragdoll = remoteRagdollsRef.current.get(rpKey);
             if (ragdoll) {
               ragdoll.cleanup();
             }
@@ -1697,8 +1982,28 @@ export default function BaseplateGame({
         </button>
       </div>
 
-      {/* Top Right: Leaderstats (Tab / Players List) Toggle */}
+      {/* Top Right: Health Bar & Leaderstats (Tab / Players List) Toggle */}
       <div className="absolute top-3 right-4 flex items-center gap-2 pointer-events-auto z-10">
+        {/* Roblox Top-Right Health Bar */}
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-md border border-white/20 shadow-lg">
+          <Heart className="w-3.5 h-3.5 text-red-400 fill-red-400" />
+          <div className="w-20 sm:w-28 h-2.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10 relative">
+            <div
+              className={`h-full transition-all duration-200 ${
+                playerHealth > 50
+                  ? 'bg-emerald-500'
+                  : playerHealth > 20
+                  ? 'bg-amber-500'
+                  : 'bg-red-500 animate-pulse'
+              }`}
+              style={{ width: `${Math.max(0, Math.min(100, playerHealth))}%` }}
+            />
+          </div>
+          <span className="text-[10px] font-mono text-white/90 font-bold min-w-[24px] text-right">
+            {Math.round(playerHealth)}
+          </span>
+        </div>
+
         <button
           onClick={() => setLeaderstatsOpen((prev) => !prev)}
           className={`flex items-center gap-2 px-3 py-1.5 rounded-lg backdrop-blur-md border text-xs font-bold transition-all cursor-pointer shadow-lg ${
@@ -2089,6 +2394,74 @@ export default function BaseplateGame({
             <p className="text-[11px] text-purple-400/50 pt-1 border-t border-purple-500/15">
               Press <strong>ESC</strong> anytime to toggle this menu.
             </p>
+          </div>
+        </div>
+      )}
+
+      {/* ===================== ROBLOX-STYLE JOINING SERVER LOADING SCREEN ===================== */}
+      {isJoining && (
+        <div
+          className={`fixed inset-0 z-50 flex flex-col items-center justify-center select-none bg-[#090614] transition-opacity duration-700 ease-in-out ${
+            joiningFadeOut ? 'opacity-0 pointer-events-none' : 'opacity-100'
+          }`}
+        >
+          {/* Subtle gradient backdrop */}
+          <div className="absolute inset-0 bg-radial from-purple-900/30 via-[#090614] to-[#04020a] pointer-events-none" />
+
+          <div className="relative z-10 flex flex-col items-center text-center px-6 max-w-md animate-fadeIn">
+            {/* Game Icon */}
+            <div className="relative mb-6">
+              <div className="w-36 h-36 sm:w-44 sm:h-44 rounded-3xl overflow-hidden border-2 border-purple-500/40 shadow-2xl shadow-purple-600/30 bg-[#160f2b] flex items-center justify-center p-1">
+                {experience?.iconUrl ? (
+                  <img
+                    src={experience.iconUrl}
+                    alt={experience.name}
+                    className="w-full h-full object-cover rounded-2xl"
+                  />
+                ) : (
+                  <div className="w-full h-full rounded-2xl bg-gradient-to-br from-[#2e1d5e] to-[#140b2a] flex flex-col items-center justify-center">
+                    <Boxes className="w-16 h-16 text-purple-400 mb-2 drop-shadow-md" />
+                    <span className="text-[11px] font-mono uppercase tracking-widest text-purple-300/70">
+                      BoBlox Place
+                    </span>
+                  </div>
+                )}
+              </div>
+              {/* Pulsing ring around icon */}
+              <div className="absolute -inset-1.5 rounded-3xl border border-purple-400/30 animate-pulse pointer-events-none" />
+            </div>
+
+            {/* Experience Title */}
+            <h1 className="text-2xl sm:text-3xl font-display font-black text-white tracking-tight drop-shadow-lg mb-2">
+              {experience?.name || 'Classic Baseplate'}
+            </h1>
+
+            {/* Creator Attribution */}
+            <p className="text-xs text-purple-300/80 mb-6 font-medium">
+              By <span className="text-purple-200 font-bold">{experience?.creatorUsername || 'Builder'}</span>
+            </p>
+
+            {/* Joining Server Status */}
+            <div className="flex flex-col items-center gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                <span className="text-base sm:text-lg font-display font-black text-purple-100 tracking-wide">
+                  Joining Server{joiningDots}
+                </span>
+              </div>
+
+              <p className="text-xs text-purple-300/60 font-mono">
+                {joiningStage}
+              </p>
+
+              {/* Progress bar */}
+              <div className="w-64 h-1.5 bg-purple-950/80 rounded-full overflow-hidden border border-purple-500/20 mt-2">
+                <div
+                  className="h-full bg-gradient-to-r from-purple-500 to-indigo-500 rounded-full transition-all duration-300 ease-out"
+                  style={{ width: `${joiningProgress}%` }}
+                />
+              </div>
+            </div>
           </div>
         </div>
       )}

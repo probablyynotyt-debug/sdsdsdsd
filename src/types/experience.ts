@@ -70,6 +70,8 @@ export interface ExperienceData {
   baseplateEnabled?: boolean;
   baseplateColor?: string;
   baseplateSize?: [number, number];
+  iconUrl?: string;
+  thumbnailUrl?: string;
 }
 
 export const EXPERIENCES_STORAGE_KEY = 'boblox_experiences_v5_user_only';

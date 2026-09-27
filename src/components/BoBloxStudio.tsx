@@ -22,7 +22,9 @@ import {
   Palette,
   Eye,
   Trash2,
-  Save
+  Save,
+  Image,
+  Camera
 } from 'lucide-react';
 import AvatarProfileIcon from './AvatarProfileIcon';
 import VerifiedBadge, { isOwnerUser, isVerifiedUser } from './VerifiedBadge';

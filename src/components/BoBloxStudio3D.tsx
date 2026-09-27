@@ -61,6 +61,7 @@ import { LuaScriptRunner, ScriptLogMessage } from '../utils/luaScriptEngine';
 import { RagdollShatterManager } from '../utils/ragdollShatter';
 import { gameAudio } from '../utils/gameAudio';
 import StudioScriptEditor from './StudioScriptEditor';
+import { uploadToCloudinary } from '../services/cloudinary';
 
 interface BoBloxStudio3DProps {
   experience: ExperienceData;
@@ -157,6 +158,12 @@ export default function BoBloxStudio3D({
   const [insertPartMenuOpen, setInsertPartMenuOpen] = useState(false);
   const [textureModalPartId, setTextureModalPartId] = useState<string | null>(null);
   const [textureFaceTarget, setTextureFaceTarget] = useState<PartFaceName>('all');
+
+  // Game Icon Upload State
+  const [expIconUrl, setExpIconUrl] = useState<string | undefined>(experience.iconUrl);
+  const [showIconModal, setShowIconModal] = useState<boolean>(false);
+  const [isUploadingIcon, setIsUploadingIcon] = useState<boolean>(false);
+  const iconFileInputRef = useRef<HTMLInputElement | null>(null);
   const [textureUploadError, setTextureUploadError] = useState<string | null>(null);
   const [statusNotification, setStatusNotification] = useState<string | null>(null);
 
@@ -921,6 +928,7 @@ part.Touched:Connect(onTouch)`,
       scripts: serverScripts,
       baseplateEnabled,
       baseplateColor,
+      iconUrl: expIconUrl,
       lastUpdated: Date.now(),
     };
     onSaveExperience(updatedExp, false);
@@ -936,12 +944,56 @@ part.Touched:Connect(onTouch)`,
       scripts: serverScripts,
       baseplateEnabled,
       baseplateColor,
+      iconUrl: expIconUrl,
       published: true,
       lastUpdated: Date.now(),
     };
     onSaveExperience(updatedExp, true);
     showToast('Published experience to BoBlox Discover!');
     setFileMenuOpen(false);
+  };
+
+  const handleIconFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsUploadingIcon(true);
+    try {
+      let finalUrl = '';
+      try {
+        finalUrl = await uploadToCloudinary(file, {
+          preset: 'ml_default',
+          folder: 'boblox_game_icons',
+        });
+      } catch {
+        finalUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
+      setExpIconUrl(finalUrl);
+      onSaveExperience(
+        {
+          ...experience,
+          name: expName.trim() || experience.name,
+          parts,
+          scripts: serverScripts,
+          baseplateEnabled,
+          baseplateColor,
+          iconUrl: finalUrl,
+          lastUpdated: Date.now(),
+        },
+        false
+      );
+      showToast('Game icon uploaded and saved successfully!');
+      setShowIconModal(false);
+    } catch {
+      showToast('Failed to upload game icon.');
+    } finally {
+      setIsUploadingIcon(false);
+      if (iconFileInputRef.current) iconFileInputRef.current.value = '';
+    }
   };
 
   // -------------------------------------------------------------
@@ -2188,7 +2240,18 @@ part.Touched:Connect(onTouch)`,
                 </button>
 
                 <button
-                  onClick={() => onSaveAndExit({ ...experience, name: expName, parts, scripts: serverScripts, baseplateEnabled, baseplateColor })}
+                  onClick={() => {
+                    setFileMenuOpen(false);
+                    setShowIconModal(true);
+                  }}
+                  className="w-full px-3 py-2 rounded-lg text-left text-xs text-white hover:bg-purple-600/30 flex items-center gap-2 transition-colors cursor-pointer"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Game Icon Settings</span>
+                </button>
+
+                <button
+                  onClick={() => onSaveAndExit({ ...experience, name: expName, parts, scripts: serverScripts, baseplateEnabled, baseplateColor, iconUrl: expIconUrl })}
                   className="w-full px-3 py-2 rounded-lg text-left text-xs text-white hover:bg-purple-600/30 flex items-center gap-2 transition-colors cursor-pointer"
                 >
                   <LogOut className="w-3.5 h-3.5 text-purple-400" />
@@ -2213,6 +2276,20 @@ part.Touched:Connect(onTouch)`,
             className="px-2 py-0.5 rounded bg-black/30 border border-purple-500/20 text-xs text-purple-200 font-medium focus:outline-none focus:border-purple-400 max-w-[200px]"
             title="Rename Experience"
           />
+
+          {/* Game Icon upload button */}
+          <button
+            onClick={() => setShowIconModal(true)}
+            className="px-2 py-1 rounded bg-[#20153b] hover:bg-[#2c1e50] border border-purple-500/30 text-purple-200 hover:text-white flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors shadow-sm"
+            title="Set Game Icon"
+          >
+            {expIconUrl ? (
+              <img src={expIconUrl} alt="Game Icon" className="w-4 h-4 rounded object-cover" />
+            ) : (
+              <ImageIcon className="w-3.5 h-3.5 text-purple-400" />
+            )}
+            <span className="hidden sm:inline">Icon</span>
+          </button>
         </div>
 
         {/* Playtest Toggle */}
@@ -2534,6 +2611,88 @@ part.Touched:Connect(onTouch)`,
           logs={scriptLogs}
           onClearLogs={() => setScriptLogs([])}
         />
+      )}
+
+      {/* Game Icon Settings Modal */}
+      {showIconModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-[#160f2e] border border-purple-500/30 rounded-2xl shadow-2xl p-6 space-y-5 animate-fadeIn">
+            <div className="flex items-center justify-between border-b border-purple-500/20 pb-3">
+              <div className="flex items-center gap-2">
+                <ImageIcon className="w-5 h-5 text-purple-400" />
+                <h3 className="text-base font-bold text-white">Experience Icon</h3>
+              </div>
+              <button
+                onClick={() => setShowIconModal(false)}
+                className="p-1 rounded-lg text-purple-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Current Icon Preview */}
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-36 h-36 rounded-2xl overflow-hidden border-2 border-purple-500/30 bg-[#1e143d] flex items-center justify-center shadow-lg relative">
+                {expIconUrl ? (
+                  <img
+                    src={expIconUrl}
+                    alt="Game Icon"
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="text-center p-4">
+                    <Boxes className="w-12 h-12 text-purple-400/50 mx-auto mb-1" />
+                    <p className="text-[11px] text-purple-300/60 font-mono">No icon set</p>
+                  </div>
+                )}
+                {isUploadingIcon && (
+                  <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2">
+                    <div className="w-6 h-6 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-[10px] text-purple-200 font-bold">Uploading...</span>
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-purple-300/70 text-center">
+                This icon appears on the Discover page, game details, and joining screen.
+              </p>
+            </div>
+
+            {/* Hidden file input */}
+            <input
+              ref={iconFileInputRef}
+              type="file"
+              accept="image/png, image/jpeg, image/webp"
+              onChange={handleIconFileSelect}
+              className="hidden"
+            />
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-purple-500/20">
+              {expIconUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setExpIconUrl(undefined);
+                    onSaveExperience({ ...experience, iconUrl: undefined }, false);
+                    showToast('Game icon removed.');
+                  }}
+                  className="px-3 py-2 rounded-xl text-xs text-red-300 hover:bg-red-950/40 border border-red-500/20 font-semibold cursor-pointer transition-colors"
+                >
+                  Remove Icon
+                </button>
+              )}
+
+              <button
+                type="button"
+                disabled={isUploadingIcon}
+                onClick={() => iconFileInputRef.current?.click()}
+                className="px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-purple-900/40 transition-all cursor-pointer disabled:opacity-50"
+              >
+                <Upload className="w-4 h-4" />
+                <span>{isUploadingIcon ? 'Uploading...' : 'Upload Image'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
