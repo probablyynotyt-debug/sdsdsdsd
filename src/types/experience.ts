@@ -32,6 +32,13 @@ export interface StudioScript {
   createdAt: number;
 }
 
+export interface ClickDetectorInstance {
+  id: string;
+  name: string;
+  maxActivationDistance: number;
+  cursorIcon?: string;
+}
+
 export interface StudioPart {
   id: string;
   name: string;
@@ -45,6 +52,9 @@ export interface StudioPart {
   reflectance: number;
   anchored: boolean; // if false, falls with physics
   canCollide: boolean; // if false, player walks through
+  location?: 'workspace' | 'replicatedstorage' | 'serverstorage' | string;
+  hasClickDetector?: boolean;
+  clickDetector?: ClickDetectorInstance | null;
   textures?: PartFaceTextures;
   textureProperties?: TextureProperties;
   scripts?: StudioScript[];

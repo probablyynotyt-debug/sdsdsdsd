@@ -80,7 +80,7 @@ interface BoBloxStudio3DProps {
 
 type StudioToolMode = 'select' | 'move' | 'scale' | 'rotate';
 type DockPosition = 'right' | 'left' | 'bottom' | 'floating';
-type SelectedExplorerItemType = 'part' | 'baseplate' | 'script' | 'serverscriptservice' | 'workspace' | null;
+type SelectedExplorerItemType = 'part' | 'baseplate' | 'script' | 'serverscriptservice' | 'workspace' | 'clickdetector' | null;
 
 interface GizmoHandleUserData {
   type: 'gizmo';
@@ -137,6 +137,19 @@ export default function BoBloxStudio3D({
     workspace: true,
     serverscriptservice: true,
   });
+
+  // Studio Center View Tabs: 'viewport' or scriptId
+  const [openScriptTabs, setOpenScriptTabs] = useState<{ script: StudioScript; parentName: string }[]>([]);
+  const [activeStudioTabId, setActiveStudioTabId] = useState<string>('viewport');
+  const [explorerSearch, setExplorerSearch] = useState<string>('');
+  const [draggedItem, setDraggedItem] = useState<{ id: string; type: 'part' | 'script' } | null>(null);
+
+  const handleDragStartItem = (e: React.DragEvent, id: string, type: 'part' | 'script') => {
+    e.stopPropagation();
+    setDraggedItem({ id, type });
+  };
+  const prevPlaytestMeshPositionsRef = useRef<Map<string, THREE.Vector3>>(new Map());
+  const lastStandingPartIdRef = useRef<string | null>(null);
 
   // Script Editor Modal State
   const [editingScript, setEditingScript] = useState<StudioScript | null>(null);
@@ -252,6 +265,25 @@ export default function BoBloxStudio3D({
     partSize: [number, number, number];
     partRot: [number, number, number];
   } | null>(null);
+
+  // Direct Face Scaling & Middle Part Body Dragging
+  const isDraggingScaleFaceRef = useRef(false);
+  const scaleFaceStartRef = useRef<{
+    axis: 'x' | 'y' | 'z';
+    dir: 1 | -1;
+    mouseX: number;
+    mouseY: number;
+    partPos: [number, number, number];
+    partSize: [number, number, number];
+  } | null>(null);
+  const isDraggingPartBodyRef = useRef(false);
+  const partBodyDragStartRef = useRef<{
+    mouseX: number;
+    mouseY: number;
+    startPos: [number, number, number];
+  } | null>(null);
+  const faceHighlightMeshRef = useRef<THREE.Mesh | null>(null);
+  const [insertObjectMenuPartId, setInsertObjectMenuPartId] = useState<string | null>(null);
 
   // Studio Free-Flight Camera controls
   const studioCamPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 14, 26));
@@ -388,34 +420,102 @@ end`,
     showToast('Added Script to ServerScriptService');
   };
 
-  const handleOpenScriptEditor = (script: StudioScript, parentName: string) => {
-    setEditingScript(script);
-    setEditingScriptParentName(parentName);
+  const handleOpenScriptEditor = (script: StudioScript, parentName: string = 'Workspace') => {
+    setOpenScriptTabs((prev) => {
+      if (prev.some((t) => t.script.id === script.id)) {
+        return prev.map((t) => (t.script.id === script.id ? { script, parentName } : t));
+      }
+      return [...prev, { script, parentName }];
+    });
+    setActiveStudioTabId(script.id);
+  };
+
+  const handleCloseScriptTab = (scriptId: string) => {
+    setOpenScriptTabs((prev) => {
+      const next = prev.filter((t) => t.script.id !== scriptId);
+      if (activeStudioTabId === scriptId) {
+        if (next.length > 0) {
+          setActiveStudioTabId(next[next.length - 1].script.id);
+        } else {
+          setActiveStudioTabId('viewport');
+        }
+      }
+      return next;
+    });
   };
 
   const handleSaveEditedScript = (updatedScript: StudioScript) => {
-    if (updatedScript.parentId === 'serverscriptservice') {
-      setServerScripts((prev) =>
-        prev.map((s) => (s.id === updatedScript.id ? updatedScript : s))
-      );
-    } else {
-      setParts((prev) =>
-        prev.map((p) => {
-          if (p.id !== updatedScript.parentId) return p;
+    setServerScripts((prev) =>
+      prev.map((s) => (s.id === updatedScript.id ? updatedScript : s))
+    );
+    setParts((prevParts) =>
+      prevParts.map((p) => {
+        if (!p.scripts) return p;
+        if (p.scripts.some((s) => s.id === updatedScript.id)) {
           return {
             ...p,
-            scripts: (p.scripts || []).map((s) =>
-              s.id === updatedScript.id ? updatedScript : s
-            ),
+            scripts: p.scripts.map((s) => (s.id === updatedScript.id ? updatedScript : s)),
           };
+        }
+        return p;
+      })
+    );
+    setOpenScriptTabs((prev) =>
+      prev.map((t) => (t.script.id === updatedScript.id ? { ...t, script: updatedScript } : t))
+    );
+    showToast(`Saved ${updatedScript.name}.lua`);
+  };
+
+  const handleDropOnTarget = (targetId: string) => {
+    if (!draggedItem) return;
+
+    if (draggedItem.type === 'part') {
+      const targetLoc = targetId === 'workspace' || targetId === 'replicatedstorage' || targetId === 'serverstorage' ? targetId : 'workspace';
+      setParts((prev) =>
+        prev.map((p) => (p.id === draggedItem.id ? { ...p, location: targetLoc } : p))
+      );
+      showToast(`Moved part into ${targetLoc}`);
+    } else if (draggedItem.type === 'script') {
+      let scriptToMove: StudioScript | null = null;
+      setServerScripts((prev) => {
+        const found = prev.find((s) => s.id === draggedItem.id);
+        if (found) scriptToMove = found;
+        return prev.filter((s) => s.id !== draggedItem.id);
+      });
+      setParts((prev) =>
+        prev.map((p) => {
+          if (p.scripts && p.scripts.some((s) => s.id === draggedItem.id)) {
+            const found = p.scripts.find((s) => s.id === draggedItem.id);
+            if (found) scriptToMove = found;
+            return { ...p, scripts: p.scripts.filter((s) => s.id !== draggedItem.id) };
+          }
+          return p;
         })
       );
+
+      setTimeout(() => {
+        if (!scriptToMove) return;
+        const updatedScript = { ...scriptToMove!, parentId: targetId };
+        if (targetId === 'serverscriptservice') {
+          setServerScripts((prev) => [...prev, updatedScript]);
+        } else {
+          setParts((prev) =>
+            prev.map((p) => {
+              if (p.id === targetId) {
+                return { ...p, scripts: [...(p.scripts || []), updatedScript] };
+              }
+              return p;
+            })
+          );
+        }
+        showToast(`Moved script into ${targetId}`);
+      }, 50);
     }
-    setEditingScript(updatedScript);
-    showToast(`Saved ${updatedScript.name}`);
+    setDraggedItem(null);
   };
 
   const handleDeleteScript = (scriptId: string, parentId: string) => {
+    handleCloseScriptTab(scriptId);
     if (parentId === 'serverscriptservice') {
       setServerScripts((prev) => prev.filter((s) => s.id !== scriptId));
     } else {
@@ -620,6 +720,48 @@ end`,
     setToolMode('move');
     setInsertPartMenuOpen(false);
     showToast(`Added ${shape} Part (Move Tool active)`);
+  };
+
+  const handleAddClickDetectorToPart = (partId: string) => {
+    pushUndoSnapshot();
+    setParts((prev) =>
+      prev.map((p) => {
+        if (p.id === partId) {
+          return {
+            ...p,
+            hasClickDetector: true,
+            clickDetector: {
+              id: `cd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              name: 'ClickDetector',
+              maxActivationDistance: 32,
+              cursorIcon: '',
+            },
+          };
+        }
+        return p;
+      })
+    );
+    setSelectedPartId(partId);
+    setSelectedItemType('clickdetector');
+    showToast('Inserted ClickDetector into Part');
+  };
+
+  const handleRemoveClickDetectorFromPart = (partId: string) => {
+    pushUndoSnapshot();
+    setParts((prev) =>
+      prev.map((p) => {
+        if (p.id === partId) {
+          const next = { ...p, hasClickDetector: false };
+          delete next.clickDetector;
+          return next;
+        }
+        return p;
+      })
+    );
+    if (selectedPartId === partId && selectedItemType === 'clickdetector') {
+      setSelectedItemType('part');
+    }
+    showToast('Removed ClickDetector from Part');
   };
 
   const handleDeletePart = (partId: string) => {
@@ -1141,29 +1283,24 @@ part.Touched:Connect(onTouch)`,
     rotateGizmo.add(makeRotateRing('y', 0x22c55e));
     rotateGizmo.add(makeRotateRing('z', 0x3b82f6));
 
-    // C. Scale Gizmo (6 Face Box Handles with interactive userData)
+    // C. Scale Gizmo (Direct Face-Surface Scaling - NO CUBES, NO DOTS!)
     const scaleGizmo = new THREE.Group();
     gizmoRoot.add(scaleGizmo);
     scaleGizmoGroupRef.current = scaleGizmo;
 
-    const makeScaleHandle = (axis: 'x' | 'y' | 'z', dir: 1 | -1, hex: number) => {
-      const mat = new THREE.MeshBasicMaterial({
-        color: hex,
-        depthTest: false,
-        depthWrite: false,
-        transparent: true,
-        opacity: 0.95,
-      });
-      const box = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.42, 0.42), mat);
-      box.userData = { type: 'gizmo', tool: 'scale', axis, dir, baseColor: hex };
-      return box;
-    };
-    scaleGizmo.add(makeScaleHandle('x', 1, 0xef4444));
-    scaleGizmo.add(makeScaleHandle('x', -1, 0xef4444));
-    scaleGizmo.add(makeScaleHandle('y', 1, 0x22c55e));
-    scaleGizmo.add(makeScaleHandle('y', -1, 0x22c55e));
-    scaleGizmo.add(makeScaleHandle('z', 1, 0x3b82f6));
-    scaleGizmo.add(makeScaleHandle('z', -1, 0x3b82f6));
+    // Glowing face highlight plane that shows which face of the part is targeted
+    const faceHighlightMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.45,
+      depthTest: false,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const faceHighlightPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), faceHighlightMat);
+    faceHighlightPlane.visible = false;
+    scene.add(faceHighlightPlane);
+    faceHighlightMeshRef.current = faceHighlightPlane;
 
     // 8. Player Character Group (Playtest Avatar)
     const playerGroup = new THREE.Group();
@@ -1308,6 +1445,34 @@ part.Touched:Connect(onTouch)`,
       if (e.button === 0) isLeftClickDownRef.current = true;
       lastMousePosRef.current = { x: e.clientX, y: e.clientY };
 
+      // Raycast ClickDetector in playtest mode
+      if (isPlaytestingRef.current && e.button === 0 && camera) {
+        const rect = container.getBoundingClientRect();
+        const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+        const meshes = Array.from(partMeshesMapRef.current.values());
+        const intersects = raycaster.intersectObjects(meshes, true);
+        if (intersects.length > 0) {
+          const hitMesh = intersects[0].object as THREE.Mesh;
+          for (const [pId, m] of partMeshesMapRef.current.entries()) {
+            if (m === hitMesh || m.children.includes(hitMesh)) {
+              const partObj = partsRef.current.find((p) => p.id === pId);
+              if (
+                partObj?.hasClickDetector ||
+                luaRunnerRef.current.hasClickDetector(pId) ||
+                (partObj?.scripts && partObj.scripts.some((s) => s.code.includes('ClickDetector') || s.code.includes('MouseClick')))
+              ) {
+                luaRunnerRef.current.triggerClick(pId);
+                gameAudio.playClickSound?.();
+              }
+              break;
+            }
+          }
+        }
+      }
+
       // Raycast click part selection or gizmo handle drag in Edit mode
       if (!isPlaytestingRef.current && e.button === 0 && camera) {
         setContextMenu(null);
@@ -1318,13 +1483,12 @@ part.Touched:Connect(onTouch)`,
         const raycaster = new THREE.Raycaster();
         raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
 
-        // 1. Raycast against active Gizmo Handles first
+        // 1. Raycast against active Move / Rotate Gizmo Handles first
         if (selectedPartIdRef.current && gizmoRootGroupRef.current && gizmoRootGroupRef.current.visible) {
           const gizmoMeshes: THREE.Mesh[] = [];
           const activeGizmo =
             toolModeRef.current === 'move' ? moveGizmoGroupRef.current :
-            toolModeRef.current === 'rotate' ? rotateGizmoGroupRef.current :
-            toolModeRef.current === 'scale' ? scaleGizmoGroupRef.current : null;
+            toolModeRef.current === 'rotate' ? rotateGizmoGroupRef.current : null;
 
           if (activeGizmo && activeGizmo.visible) {
             activeGizmo.traverse((child) => {
@@ -1366,17 +1530,83 @@ part.Touched:Connect(onTouch)`,
           }
         }
 
-        // 2. Raycast to select part in scene
+        // 2. Direct Face Scaling (no cubes, no dots: grab any face to scale!)
+        if (toolModeRef.current === 'scale' && selectedPartIdRef.current) {
+          const selectedMesh = partMeshesMapRef.current.get(selectedPartIdRef.current);
+          if (selectedMesh) {
+            const faceHits = raycaster.intersectObject(selectedMesh, false);
+            if (faceHits.length > 0 && faceHits[0].face) {
+              const normal = faceHits[0].face.normal.clone().applyEuler(selectedMesh.rotation);
+              let axis: 'x' | 'y' | 'z' = 'y';
+              let dir: 1 | -1 = 1;
+              const absX = Math.abs(normal.x);
+              const absY = Math.abs(normal.y);
+              const absZ = Math.abs(normal.z);
+              if (absY >= absX && absY >= absZ) {
+                axis = 'y';
+                dir = normal.y >= 0 ? 1 : -1;
+              } else if (absX >= absY && absX >= absZ) {
+                axis = 'x';
+                dir = normal.x >= 0 ? 1 : -1;
+              } else {
+                axis = 'z';
+                dir = normal.z >= 0 ? 1 : -1;
+              }
+
+              const curPart = partsRef.current.find((p) => p.id === selectedPartIdRef.current);
+              if (curPart) {
+                isDraggingScaleFaceRef.current = true;
+                scaleFaceStartRef.current = {
+                  axis,
+                  dir,
+                  mouseX: e.clientX,
+                  mouseY: e.clientY,
+                  partPos: [...curPart.position],
+                  partSize: [...curPart.size],
+                };
+                return;
+              }
+            }
+          }
+        }
+
+        // 3. Raycast to select part in scene or hold middle to drag anywhere
         const meshes = Array.from(partMeshesMapRef.current.values());
         const hits = raycaster.intersectObjects(meshes, true);
         if (hits.length > 0) {
           let hitMesh = hits[0].object as THREE.Mesh;
+          let hitPartId: string | null = null;
           for (const [id, m] of partMeshesMapRef.current.entries()) {
             if (m === hitMesh || m.children.includes(hitMesh)) {
-              setSelectedPartId(id);
-              setSelectedItemType('part');
+              hitPartId = id;
+              break;
+            }
+          }
+
+          if (hitPartId) {
+            setSelectedPartId(hitPartId);
+            setSelectedItemType('part');
+            selectedPartIdRef.current = hitPartId;
+
+            // In Move or Select mode: hold middle/body of part to drag anywhere across 3D plane
+            const targetPart = partsRef.current.find((p) => p.id === hitPartId);
+            if (targetPart && (toolModeRef.current === 'move' || toolModeRef.current === 'select')) {
+              isDraggingPartBodyRef.current = true;
+              dragPlaneRef.current = new THREE.Plane(new THREE.Vector3(0, 1, 0), -targetPart.position[1]);
+              const intersection = new THREE.Vector3();
+              if (raycaster.ray.intersectPlane(dragPlaneRef.current, intersection)) {
+                dragPlaneStartIntersectionRef.current.copy(intersection);
+              } else {
+                dragPlaneStartIntersectionRef.current.set(targetPart.position[0], targetPart.position[1], targetPart.position[2]);
+              }
+              partBodyDragStartRef.current = {
+                mouseX: e.clientX,
+                mouseY: e.clientY,
+                startPos: [...targetPart.position],
+              };
               return;
             }
+            return;
           }
         }
       }
@@ -1390,6 +1620,20 @@ part.Touched:Connect(onTouch)`,
         isDraggingGizmoRef.current = false;
         activeGizmoHandleRef.current = null;
         gizmoDragStartRef.current = null;
+        setGizmoTooltip(null);
+        setParts([...partsRef.current]);
+        pushUndoSnapshot(partsRef.current);
+      }
+      if (isDraggingScaleFaceRef.current) {
+        isDraggingScaleFaceRef.current = false;
+        scaleFaceStartRef.current = null;
+        setGizmoTooltip(null);
+        setParts([...partsRef.current]);
+        pushUndoSnapshot(partsRef.current);
+      }
+      if (isDraggingPartBodyRef.current) {
+        isDraggingPartBodyRef.current = false;
+        partBodyDragStartRef.current = null;
         setGizmoTooltip(null);
         setParts([...partsRef.current]);
         pushUndoSnapshot(partsRef.current);
@@ -1409,9 +1653,124 @@ part.Touched:Connect(onTouch)`,
             -1.1,
             1.25
           );
+        } else if (camera) {
+          const rect = container.getBoundingClientRect();
+          const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+          const meshes = Array.from(partMeshesMapRef.current.values());
+          const intersects = raycaster.intersectObjects(meshes, true);
+          let hoverDetector = false;
+          if (intersects.length > 0) {
+            const hitMesh = intersects[0].object as THREE.Mesh;
+            for (const [pId, m] of partMeshesMapRef.current.entries()) {
+              if (m === hitMesh || m.children.includes(hitMesh)) {
+                const partObj = partsRef.current.find((p) => p.id === pId);
+                if (
+                  partObj?.hasClickDetector ||
+                  partObj?.clickDetector ||
+                  luaRunnerRef.current.hasClickDetector(pId) ||
+                  (partObj?.scripts && partObj.scripts.some((s) => s.code.includes('ClickDetector') || s.code.includes('MouseClick')))
+                ) {
+                  hoverDetector = true;
+                }
+                break;
+              }
+            }
+          }
+          container.style.cursor = hoverDetector ? 'pointer' : 'crosshair';
         }
       } else {
-        // Edit Mode Gizmo Dragging
+        // Edit Mode: 1. Dragging Face Surface to Scale (no cubes, no dots!)
+        if (isDraggingScaleFaceRef.current && scaleFaceStartRef.current) {
+          const start = scaleFaceStartRef.current;
+          const pId = selectedPartIdRef.current;
+          if (pId) {
+            const screenDx = e.clientX - start.mouseX;
+            const screenDy = start.mouseY - e.clientY; // positive = moving mouse UP
+            let rawDelta = 0;
+            if (start.axis === 'y') {
+              rawDelta = screenDy * 0.08 * start.dir;
+            } else if (start.axis === 'x') {
+              rawDelta = screenDx * 0.08 * start.dir;
+            } else {
+              rawDelta = (screenDx + screenDy) * 0.06 * start.dir;
+            }
+
+            const snapMove = gridSnapMoveRef.current;
+            let actualDelta = rawDelta;
+            if (snapMove > 0) {
+              actualDelta = Math.round(actualDelta / snapMove) * snapMove;
+            }
+
+            const axisIdx = start.axis === 'x' ? 0 : start.axis === 'y' ? 1 : 2;
+            const newDim = Math.max(0.5, Math.round((start.partSize[axisIdx] + actualDelta) * 2) / 2);
+            const sizeChange = newDim - start.partSize[axisIdx];
+
+            const newSize: [number, number, number] = [...start.partSize];
+            newSize[axisIdx] = newDim;
+
+            const newPos: [number, number, number] = [...start.partPos];
+            newPos[axisIdx] = Math.round((start.partPos[axisIdx] + (sizeChange / 2) * start.dir) * 2) / 2;
+
+            partsRef.current = partsRef.current.map((p) => (p.id === pId ? { ...p, size: newSize, position: newPos } : p));
+            const mesh = partMeshesMapRef.current.get(pId);
+            if (mesh) {
+              mesh.position.set(newPos[0], newPos[1], newPos[2]);
+              mesh.scale.set(
+                newSize[0] / start.partSize[0],
+                newSize[1] / start.partSize[1],
+                newSize[2] / start.partSize[2]
+              );
+            }
+            if (gizmoRootGroupRef.current) gizmoRootGroupRef.current.position.set(newPos[0], newPos[1], newPos[2]);
+            const axisName = start.axis === 'y' ? 'Height' : start.axis === 'x' ? 'Width' : 'Depth';
+            setGizmoTooltip(`Scale ${axisName} (${start.axis.toUpperCase()}): ${newSize[axisIdx].toFixed(1)} studs [${newSize.join(' × ')}]`);
+          }
+          return;
+        }
+
+        // Edit Mode: 2. Dragging Part Body/Middle to Move Anywhere
+        if (isDraggingPartBodyRef.current && partBodyDragStartRef.current && camera) {
+          const rect = container.getBoundingClientRect();
+          const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+
+          const start = partBodyDragStartRef.current;
+          const pId = selectedPartIdRef.current;
+          if (pId && dragPlaneRef.current) {
+            const curIntersect = new THREE.Vector3();
+            if (raycaster.ray.intersectPlane(dragPlaneRef.current, curIntersect)) {
+              const deltaX = curIntersect.x - dragPlaneStartIntersectionRef.current.x;
+              const deltaZ = curIntersect.z - dragPlaneStartIntersectionRef.current.z;
+              const snapMove = gridSnapMoveRef.current;
+
+              let newX = start.startPos[0] + deltaX;
+              let newZ = start.startPos[2] + deltaZ;
+              if (snapMove > 0) {
+                newX = Math.round(newX / snapMove) * snapMove;
+                newZ = Math.round(newZ / snapMove) * snapMove;
+              }
+              const newPos: [number, number, number] = [
+                Math.round(newX * 2) / 2,
+                start.startPos[1],
+                Math.round(newZ * 2) / 2,
+              ];
+
+              partsRef.current = partsRef.current.map((p) => (p.id === pId ? { ...p, position: newPos } : p));
+              const mesh = partMeshesMapRef.current.get(pId);
+              if (mesh) mesh.position.set(newPos[0], newPos[1], newPos[2]);
+              if (gizmoRootGroupRef.current) gizmoRootGroupRef.current.position.set(newPos[0], newPos[1], newPos[2]);
+              setGizmoTooltip(`Move Part: [${newPos[0].toFixed(1)}, ${newPos[1].toFixed(1)}, ${newPos[2].toFixed(1)}] studs`);
+            }
+          }
+          return;
+        }
+
+        // Edit Mode: 3. Arrow / Ring Gizmo Dragging
         if (isDraggingGizmoRef.current && activeGizmoHandleRef.current && gizmoDragStartRef.current && camera) {
           const rect = container.getBoundingClientRect();
           const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1470,38 +1829,66 @@ part.Touched:Connect(onTouch)`,
                 );
               }
               setGizmoTooltip(`Rotate ${axis.toUpperCase()}: ${angleDeg >= 0 ? '+' : ''}${Math.round(angleDeg)}°`);
-            } else if (handle.tool === 'scale' && pId) {
-              const axis = handle.axis;
-              const dir = handle.dir || 1;
-              let axisDelta = (axis === 'x' ? planeDelta.x : axis === 'y' ? planeDelta.y : planeDelta.z) * dir;
-              if (snapMove > 0) {
-                axisDelta = Math.round(axisDelta / snapMove) * snapMove;
-              }
-              const axisIdx = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
-              const newDim = Math.max(0.5, start.partSize[axisIdx] + axisDelta);
-              const actualDelta = newDim - start.partSize[axisIdx];
-
-              const newSize: [number, number, number] = [...start.partSize];
-              newSize[axisIdx] = Math.round(newDim * 2) / 2;
-
-              const newPos: [number, number, number] = [...start.partPos];
-              newPos[axisIdx] = Math.round((start.partPos[axisIdx] + (actualDelta / 2) * dir) * 2) / 2;
-
-              partsRef.current = partsRef.current.map((p) => (p.id === pId ? { ...p, size: newSize, position: newPos } : p));
-              const mesh = partMeshesMapRef.current.get(pId);
-              if (mesh) {
-                mesh.position.set(newPos[0], newPos[1], newPos[2]);
-                mesh.scale.set(
-                  newSize[0] / start.partSize[0],
-                  newSize[1] / start.partSize[1],
-                  newSize[2] / start.partSize[2]
-                );
-              }
-              if (gizmoRootGroupRef.current) gizmoRootGroupRef.current.position.set(newPos[0], newPos[1], newPos[2]);
-              setGizmoTooltip(`Size ${axis.toUpperCase()}: ${newSize[0].toFixed(1)} × ${newSize[1].toFixed(1)} × ${newSize[2].toFixed(1)} studs`);
             }
           }
           return;
+        }
+
+        // Edit Mode: 4. Face Hover Highlighting when Scale Tool is active
+        if (toolModeRef.current === 'scale' && selectedPartIdRef.current && camera) {
+          const rect = container.getBoundingClientRect();
+          const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+
+          const selectedMesh = partMeshesMapRef.current.get(selectedPartIdRef.current);
+          const curPart = partsRef.current.find((p) => p.id === selectedPartIdRef.current);
+          if (selectedMesh && curPart) {
+            const hits = raycaster.intersectObject(selectedMesh, false);
+            if (hits.length > 0 && hits[0].face && faceHighlightMeshRef.current) {
+              const normal = hits[0].face.normal.clone().applyEuler(selectedMesh.rotation);
+              const absX = Math.abs(normal.x);
+              const absY = Math.abs(normal.y);
+              const absZ = Math.abs(normal.z);
+
+              const hl = faceHighlightMeshRef.current;
+              hl.visible = true;
+              hl.rotation.copy(selectedMesh.rotation);
+
+              const px = curPart.position[0];
+              const py = curPart.position[1];
+              const pz = curPart.position[2];
+              const sx = curPart.size[0];
+              const sy = curPart.size[1];
+              const sz = curPart.size[2];
+
+              if (absY >= absX && absY >= absZ) {
+                const dir = normal.y >= 0 ? 1 : -1;
+                hl.position.set(px, py + (sy / 2 + 0.02) * dir, pz);
+                hl.rotation.set(-Math.PI / 2, 0, 0);
+                hl.scale.set(sx, sz, 1);
+                container.style.cursor = 'ns-resize';
+              } else if (absX >= absY && absX >= absZ) {
+                const dir = normal.x >= 0 ? 1 : -1;
+                hl.position.set(px + (sx / 2 + 0.02) * dir, py, pz);
+                hl.rotation.set(0, Math.PI / 2, 0);
+                hl.scale.set(sz, sy, 1);
+                container.style.cursor = 'ew-resize';
+              } else {
+                const dir = normal.z >= 0 ? 1 : -1;
+                hl.position.set(px, py, pz + (sz / 2 + 0.02) * dir);
+                hl.rotation.set(0, 0, 0);
+                hl.scale.set(sx, sy, 1);
+                container.style.cursor = 'move';
+              }
+            } else if (faceHighlightMeshRef.current) {
+              faceHighlightMeshRef.current.visible = false;
+              container.style.cursor = 'crosshair';
+            }
+          }
+        } else if (faceHighlightMeshRef.current && faceHighlightMeshRef.current.visible) {
+          faceHighlightMeshRef.current.visible = false;
         }
 
         // Camera flight with right click
@@ -1741,30 +2128,84 @@ part.Touched:Connect(onTouch)`,
           walkAnimTimer += delta * 14;
         }
 
+        // Elevators and Moving Platform 3D Delta Transfer
+        if (lastStandingPartIdRef.current) {
+          const standingMesh = partMeshesMapRef.current.get(lastStandingPartIdRef.current);
+          const standingPart = curParts.find((p) => p.id === lastStandingPartIdRef.current);
+          if (standingMesh && standingPart) {
+            const currPos = standingMesh.position.clone();
+            const prevPos = prevPlaytestMeshPositionsRef.current.get(lastStandingPartIdRef.current);
+            if (prevPos) {
+              const dx = currPos.x - prevPos.x;
+              const dy = currPos.y - prevPos.y;
+              const dz = currPos.z - prevPos.z;
+              if (Math.abs(dx) > 0.00001 || Math.abs(dz) > 0.00001) {
+                playerPosRef.current.x += dx;
+                playerPosRef.current.z += dz;
+              }
+            }
+
+            const hx = standingPart.size[0] / 2 + 0.9;
+            const hz = standingPart.size[2] / 2 + 0.9;
+            const partTop = currPos.y + standingPart.size[1] / 2;
+            const isOverPlatform =
+              playerPosRef.current.x >= currPos.x - hx &&
+              playerPosRef.current.x <= currPos.x + hx &&
+              playerPosRef.current.z >= currPos.z - hz &&
+              playerPosRef.current.z <= currPos.z + hz;
+
+            if (isOverPlatform) {
+              // Elevators moving up or down: keep player glued firmly on the platform surface
+              if (playerVelocityYRef.current <= 0.5 && playerPosRef.current.y <= partTop + 0.8 && playerPosRef.current.y >= partTop - 3.5) {
+                playerPosRef.current.y = partTop;
+                playerVelocityYRef.current = 0;
+                isGroundedRef.current = true;
+              }
+            }
+          }
+        }
+
         // Gravity & Void Detection
         playerVelocityYRef.current -= 34 * delta;
         playerPosRef.current.y += playerVelocityYRef.current * delta;
 
+        // Store current mesh positions for next frame delta
+        partMeshesMapRef.current.forEach((mesh, partId) => {
+          prevPlaytestMeshPositionsRef.current.set(partId, mesh.position.clone());
+        });
+
         let floorY = baseplateEnabledRef.current ? 0 : -999;
+        let standingPartId: string | null = null;
+
         curParts.forEach((part) => {
           if (part.canCollide !== false) {
-            const hx = part.size[0] / 2 + 0.7;
-            const hz = part.size[2] / 2 + 0.7;
+            const mesh = partMeshesMapRef.current.get(part.id);
+            const currentPartX = mesh ? mesh.position.x : part.position[0];
+            const currentPartY = mesh ? mesh.position.y : part.position[1];
+            const currentPartZ = mesh ? mesh.position.z : part.position[2];
+
+            const hx = part.size[0] / 2 + 0.9;
+            const hz = part.size[2] / 2 + 0.9;
             if (
-              playerPosRef.current.x >= part.position[0] - hx &&
-              playerPosRef.current.x <= part.position[0] + hx &&
-              playerPosRef.current.z >= part.position[2] - hz &&
-              playerPosRef.current.z <= part.position[2] + hz
+              playerPosRef.current.x >= currentPartX - hx &&
+              playerPosRef.current.x <= currentPartX + hx &&
+              playerPosRef.current.z >= currentPartZ - hz &&
+              playerPosRef.current.z <= currentPartZ + hz
             ) {
-              const partTop = part.position[1] + part.size[1] / 2;
-              if (playerPosRef.current.y >= partTop - 2.0) {
-                floorY = Math.max(floorY, partTop);
+              const partTop = currentPartY + part.size[1] / 2;
+              if (playerPosRef.current.y >= partTop - 2.5) {
+                if (partTop >= floorY) {
+                  floorY = partTop;
+                  standingPartId = part.id;
+                }
               }
             }
           }
         });
 
-        if (playerPosRef.current.y <= floorY + 0.2) {
+        lastStandingPartIdRef.current = standingPartId;
+
+        if (playerPosRef.current.y <= floorY + 0.25) {
           playerPosRef.current.y = floorY;
           playerVelocityYRef.current = 0;
           isGroundedRef.current = true;
@@ -1894,7 +2335,17 @@ part.Touched:Connect(onTouch)`,
         camera.lookAt(playerPosRef.current.x, playerPosRef.current.y + 2.5, playerPosRef.current.z);
       }
 
-      renderer.render(scene, camera);
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (w > 0 && h > 0) {
+        const aspect = w / h;
+        if (Math.abs(camera.aspect - aspect) > 0.001) {
+          camera.aspect = aspect;
+          camera.updateProjectionMatrix();
+          renderer.setSize(w, h, false);
+        }
+        renderer.render(scene, camera);
+      }
     };
 
     animId = requestAnimationFrame(animate);
@@ -1914,7 +2365,7 @@ part.Touched:Connect(onTouch)`,
       partMeshesMapRef.current.clear();
       gameAudio.stopWalking();
     };
-  }, [baseplateColor, avatarColors, selectedFaceId, shirtDataUrl, pantsDataUrl, handleTogglePlaytest, handleUndo, handleRedo, triggerPlayerDeath, playerWalkSpeed, playerHealth]);
+  }, [baseplateColor]);
 
   // Sync parts into 3D meshes map
   useEffect(() => {
@@ -1971,6 +2422,31 @@ part.Touched:Connect(onTouch)`,
       }
     });
   }, [parts]);
+
+  // Handle tab switch back to 3D viewport (resize canvas, update camera aspect, force render)
+  useEffect(() => {
+    if (activeStudioTabId === 'viewport') {
+      const resizeAndRender = () => {
+        const container = containerRef.current;
+        const renderer = rendererRef.current;
+        const camera = cameraRef.current;
+        const scene = sceneRef.current;
+        if (container && renderer && camera && scene) {
+          const w = container.clientWidth || window.innerWidth;
+          const h = container.clientHeight || window.innerHeight;
+          if (w > 0 && h > 0) {
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h, false);
+            renderer.render(scene, camera);
+          }
+        }
+      };
+      resizeAndRender();
+      const rId = requestAnimationFrame(resizeAndRender);
+      return () => cancelAnimationFrame(rId);
+    }
+  }, [activeStudioTabId]);
 
   // -------------------------------------------------------------
   // RENDER PROPERTIES PANEL CONTENT
@@ -2118,6 +2594,59 @@ part.Touched:Connect(onTouch)`,
             </div>
           </div>
 
+          {/* ClickDetector Component Section */}
+          <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/25 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                <MousePointer className="w-3.5 h-3.5 text-amber-400" />
+                <span>ClickDetector Component</span>
+              </span>
+              {selectedPart.hasClickDetector || selectedPart.clickDetector ? (
+                <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 font-bold">
+                  Active
+                </span>
+              ) : (
+                <span className="text-[10px] text-purple-300/40">Not Present</span>
+              )}
+            </div>
+
+            {selectedPart.hasClickDetector || selectedPart.clickDetector ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-[11px] p-2 rounded-lg bg-black/40 border border-amber-500/20">
+                  <span className="text-amber-200/80">MaxActivationDistance:</span>
+                  <span className="font-mono text-white font-bold">{selectedPart.clickDetector?.maxActivationDistance || 32} studs</span>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setSelectedItemType('clickdetector')}
+                    className="flex-1 py-1 rounded-lg bg-amber-600/30 hover:bg-amber-600/50 text-amber-200 text-[10px] font-bold border border-amber-500/30 cursor-pointer"
+                  >
+                    Configure Properties
+                  </button>
+                  <button
+                    onClick={() => handleRemoveClickDetectorFromPart(selectedPart.id)}
+                    className="px-2.5 py-1 rounded-lg bg-red-950/50 hover:bg-red-900/60 text-red-300 text-[10px] font-bold border border-red-500/30 cursor-pointer"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <p className="text-[11px] text-amber-200/60 mb-2">
+                  Allows player mouse click interactions (hover pointer cursor, ClickDetector.MouseClick events in Lua).
+                </p>
+                <button
+                  onClick={() => handleAddClickDetectorToPart(selectedPart.id)}
+                  className="w-full py-1.5 rounded-lg bg-amber-600/40 hover:bg-amber-600/60 text-amber-200 text-xs font-bold border border-amber-500/40 cursor-pointer flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5 text-amber-300" />
+                  <span>+ Insert ClickDetector</span>
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* Attached Scripts Section */}
           <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/25 space-y-2.5">
             <div className="flex items-center justify-between">
@@ -2173,6 +2702,77 @@ part.Touched:Connect(onTouch)`,
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      );
+    }
+
+    // 3. CLICKDETECTOR PROPERTIES
+    const activePartForClickDetector = parts.find((p) => p.id === selectedPartId);
+    if (selectedItemType === 'clickdetector' && activePartForClickDetector) {
+      const targetPart = activePartForClickDetector;
+      return (
+        <div className="flex-1 overflow-y-auto p-3 text-xs space-y-4">
+          <div className="space-y-2 pb-2 border-b border-purple-500/15">
+            <div className="flex items-center justify-between">
+              <label className="text-[10px] font-bold text-amber-300 uppercase">ClickDetector Object</label>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-950/60 border border-amber-500/30 text-amber-300 font-mono">
+                Instance.ClickDetector
+              </span>
+            </div>
+            <div className="text-[11px] text-purple-200">
+              Parent: <span className="font-bold text-white">{targetPart.name}</span>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <label className="text-[10px] font-bold text-white/70 uppercase">MaxActivationDistance (studs)</label>
+              <input
+                type="number"
+                min={1}
+                max={128}
+                value={targetPart.clickDetector?.maxActivationDistance || 32}
+                onChange={(e) => {
+                  const val = Math.max(1, Number(e.target.value) || 32);
+                  handleUpdateSelectedPart({
+                    hasClickDetector: true,
+                    clickDetector: {
+                      id: targetPart.clickDetector?.id || `cd-${Date.now()}`,
+                      name: 'ClickDetector',
+                      maxActivationDistance: val,
+                      cursorIcon: '',
+                    },
+                  });
+                }}
+                className="w-full mt-1 px-2.5 py-1.5 rounded-lg bg-[#1a1233] border border-purple-500/20 text-white font-mono"
+              />
+              <span className="text-[10px] text-purple-400/60">Maximum distance from player to activate click</span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-2">
+              <div className="text-[11px] font-bold text-amber-300 flex items-center gap-1.5">
+                <MousePointer className="w-3.5 h-3.5" />
+                <span>Lua Script Event Usage:</span>
+              </div>
+              <pre className="p-2 rounded bg-black/50 text-[10px] text-amber-200 font-mono whitespace-pre-wrap">
+{`local click = script.Parent.ClickDetector
+
+click.MouseClick:Connect(function(player)
+    print("Clicked by", player)
+    script.Parent.Transparency = 1
+    script.Parent.CanCollide = false
+end)`}
+              </pre>
+            </div>
+
+            <button
+              onClick={() => handleRemoveClickDetectorFromPart(targetPart.id)}
+              className="w-full py-2 px-3 rounded-lg bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-500/30 font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete ClickDetector</span>
+            </button>
           </div>
         </div>
       );
@@ -2388,168 +2988,364 @@ part.Touched:Connect(onTouch)`,
         </div>
       </div>
 
-      {/* Main Workspace */}
+      {/* Main Workspace Workspace Area */}
       <div className="flex-1 flex overflow-hidden relative">
-        {/* Center 3D Viewport */}
-        <div className="flex-1 flex flex-col h-full overflow-hidden relative">
-          <div ref={containerRef} className="flex-1 w-full h-full relative cursor-crosshair focus:outline-none" tabIndex={0} />
+        {/* Center Main Workspace Canvas or Embedded Lua Script Editor */}
+        <div className="flex-1 flex flex-col h-full overflow-hidden relative bg-[#181228]">
+          {/* Top Tab Bar (Viewport + Open Script Tabs) */}
+          <div className="h-9 bg-[#120d20] border-b border-purple-500/20 px-2 flex items-center gap-1 overflow-x-auto select-none shrink-0 z-20 scrollbar-none">
+            {/* 3D Viewport Tab */}
+            <button
+              onClick={() => setActiveStudioTabId('viewport')}
+              className={`px-3 py-1.5 rounded-t-lg text-xs font-bold flex items-center gap-2 transition-all cursor-pointer border-t border-x shrink-0 ${
+                activeStudioTabId === 'viewport'
+                  ? 'bg-[#181228] text-white border-purple-500/30 shadow-md'
+                  : 'text-purple-300/60 hover:text-white hover:bg-purple-900/20 border-transparent'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5 text-purple-400" />
+              <span>{expName}</span>
+            </button>
 
-          {/* Viewport Overlay Controls HUD */}
-          <div className="absolute top-3 left-3 pointer-events-none space-y-2">
-            <div className="px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-[11px] text-purple-200 font-mono flex items-center gap-2 shadow-lg">
-              <Compass className="w-3.5 h-3.5 text-purple-400" />
-              <span>Right-Click + WASD to Fly • 1: Select • 2: Move • 3: Scale • 4: Rotate • F5: Playtest</span>
-            </div>
-
-            {statusNotification && (
-              <div className="px-3.5 py-2 rounded-xl bg-purple-600/90 text-white text-xs font-bold shadow-xl border border-purple-400/50 animate-fadeIn pointer-events-auto">
-                {statusNotification}
-              </div>
-            )}
-          </div>
-
-          {/* Death Red Vignette & 3-Second Respawn Banner */}
-          {isDead && (
-            <div className="absolute inset-0 z-50 bg-red-950/40 pointer-events-none flex flex-col items-center justify-center animate-fadeIn backdrop-blur-[2px]">
-              <div className="p-6 rounded-2xl bg-black/80 border border-red-500/50 shadow-2xl text-center space-y-2">
-                <h2 className="text-3xl font-black font-display text-red-500 tracking-tight">YOU DIED</h2>
-                <p className="text-xs text-red-200 font-medium">Your avatar shattered into pieces.</p>
-                <div className="text-sm font-bold text-white font-mono pt-1">
-                  Respawning in <span className="text-amber-400 text-lg">{deathCountdown}</span>...
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Right Sidebar: Explorer & Properties */}
-        <aside style={{ width: sideDockWidth }} className="bg-[#120c22] border-l border-purple-500/20 flex flex-col shrink-0 z-20 overflow-hidden shadow-2xl relative">
-          {/* Top Half: Explorer Panel */}
-          <div className="h-64 flex flex-col border-b border-purple-500/20 overflow-hidden">
-            <div className="p-2.5 bg-[#17102c] border-b border-purple-500/15 flex items-center justify-between text-xs font-bold text-white">
-              <span className="flex items-center gap-1.5">
-                <Layers className="w-4 h-4 text-purple-400" />
-                <span>Explorer</span>
-              </span>
-            </div>
-
-            {/* Tree View */}
-            <div className="flex-1 overflow-y-auto p-2 space-y-1 text-xs font-mono">
-              {/* Workspace Root */}
-              <div
-                onClick={() => setSelectedItemType('workspace')}
-                className={`flex items-center justify-between px-2 py-1 rounded cursor-pointer ${
-                  selectedItemType === 'workspace' ? 'bg-purple-600/30 text-purple-200 font-bold' : 'text-purple-300'
-                }`}
-              >
-                <div className="flex items-center gap-1.5">
-                  <Boxes className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Workspace</span>
-                </div>
-              </div>
-
-              {/* Baseplate */}
-              {baseplateEnabled && (
+            {/* Open Script Tabs */}
+            {openScriptTabs.map((tab) => {
+              const isActive = activeStudioTabId === tab.script.id;
+              return (
                 <div
-                  onClick={() => {
-                    setSelectedItemType('baseplate');
-                    setSelectedPartId(null);
-                  }}
-                  className={`flex items-center justify-between pl-6 pr-2 py-1 rounded cursor-pointer ${
-                    selectedItemType === 'baseplate' ? 'bg-purple-600 text-white font-bold shadow-sm' : 'text-purple-400/80 hover:bg-purple-950/40'
+                  key={tab.script.id}
+                  onClick={() => setActiveStudioTabId(tab.script.id)}
+                  className={`px-3 py-1.5 rounded-t-lg text-xs font-bold flex items-center gap-2 transition-all cursor-pointer border-t border-x shrink-0 group ${
+                    isActive
+                      ? 'bg-[#181228] text-blue-300 border-blue-500/30 shadow-md'
+                      : 'text-purple-300/60 hover:text-white hover:bg-purple-900/20 border-transparent'
                   }`}
                 >
-                  <div className="flex items-center gap-2">
-                    <div className="w-2.5 h-2.5 rounded-xs bg-slate-600" />
-                    <span>Baseplate</span>
-                  </div>
+                  <FileCode className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                  <span className="truncate max-w-[130px]">{tab.script.name}.lua</span>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      setBaseplateEnabled(false);
-                      showToast('Deleted Baseplate');
+                      handleCloseScriptTab(tab.script.id);
                     }}
-                    className="text-red-400 hover:text-white p-0.5 rounded cursor-pointer"
-                    title="Delete Baseplate"
+                    className="p-0.5 rounded text-purple-400/50 hover:text-white hover:bg-white/10 opacity-60 group-hover:opacity-100 transition-opacity cursor-pointer"
                   >
-                    <Trash2 className="w-3 h-3" />
+                    <X className="w-3 h-3" />
                   </button>
                 </div>
+              );
+            })}
+          </div>
+
+          {/* Center Content Viewport or Script Editor */}
+          <div className="flex-1 relative overflow-hidden bg-[#0d0918]">
+            {/* 3D Viewport is ALWAYS mounted and kept alive in DOM with real dimensions so WebGL context is never lost */}
+            <div
+              className={`w-full h-full absolute inset-0 ${
+                activeStudioTabId === 'viewport'
+                  ? 'visible pointer-events-auto z-10'
+                  : 'invisible pointer-events-none -z-10'
+              }`}
+            >
+              <div ref={containerRef} className="w-full h-full cursor-crosshair focus:outline-none" tabIndex={0} />
+
+              {/* Viewport Overlay Controls HUD */}
+              <div className="absolute top-3 left-3 pointer-events-none space-y-2">
+                <div className="px-3 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-[11px] text-purple-200 font-mono flex items-center gap-2 shadow-lg">
+                  <Compass className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Right-Click + WASD to Fly • 1: Select • 2: Move (or drag part body) • 3: Scale (drag faces) • 4: Rotate • F5: Playtest</span>
+                </div>
+
+                {statusNotification && (
+                  <div className="px-3.5 py-2 rounded-xl bg-purple-600/90 text-white text-xs font-bold shadow-xl border border-purple-400/50 animate-fadeIn pointer-events-auto">
+                    {statusNotification}
+                  </div>
+                )}
+              </div>
+
+              {/* Death Red Vignette & 3-Second Respawn Banner */}
+              {isDead && (
+                <div className="absolute inset-0 z-50 bg-red-950/40 pointer-events-none flex flex-col items-center justify-center animate-fadeIn backdrop-blur-[2px]">
+                  <div className="p-6 rounded-2xl bg-black/80 border border-red-500/50 shadow-2xl text-center space-y-2">
+                    <h2 className="text-3xl font-black font-display text-red-500 tracking-tight">YOU DIED</h2>
+                    <p className="text-xs text-red-200 font-medium">Your avatar shattered into pieces.</p>
+                    <div className="text-sm font-bold text-white font-mono pt-1">
+                      Respawning in <span className="text-amber-400 text-lg">{deathCountdown}</span>...
+                    </div>
+                  </div>
+                </div>
               )}
+            </div>
 
-              {/* Custom Parts Tree with Scripts */}
-              {parts.map((part) => {
-                const isSelected = selectedPartId === part.id && selectedItemType === 'part';
-                const hasScripts = (part.scripts || []).length > 0;
-                const isExpanded = expandedFolders[part.id] !== false;
+            {/* Open Script Tabs */}
+            {openScriptTabs.map((tab) => (
+              <div
+                key={tab.script.id}
+                className={`w-full h-full absolute inset-0 bg-[#0e0a1a] z-20 ${activeStudioTabId === tab.script.id ? 'block' : 'hidden'}`}
+              >
+                <StudioScriptEditor
+                  script={tab.script}
+                  parentName={tab.parentName}
+                  onSaveScript={handleSaveEditedScript}
+                  onClose={() => handleCloseScriptTab(tab.script.id)}
+                  logs={scriptLogs}
+                  onClearLogs={() => setScriptLogs([])}
+                  embedded={true}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
 
-                return (
-                  <div key={part.id} className="space-y-0.5">
+        {/* Right Sidebar: Explorer & Properties */}
+        <aside style={{ width: sideDockWidth }} className="bg-[#120c22] border-l border-purple-500/20 flex flex-col shrink-0 z-20 overflow-hidden shadow-2xl relative select-none">
+          {/* Top Half: Explorer Panel */}
+          <div className="h-72 flex flex-col border-b border-purple-500/20 overflow-hidden">
+            <div className="p-2 bg-[#17102c] border-b border-purple-500/15 flex items-center justify-between text-xs font-bold text-white">
+              <span className="flex items-center gap-1.5">
+                <Layers className="w-3.5 h-3.5 text-purple-400" />
+                <span>Explorer</span>
+              </span>
+              <span className="text-[10px] text-purple-300/50 font-mono">Filter workspace</span>
+            </div>
+
+            {/* Filter workspace Search */}
+            <div className="px-2 py-1.5 bg-[#140e26] border-b border-white/5">
+              <input
+                type="text"
+                placeholder="Filter workspace (Ctrl+Shift+X)"
+                value={explorerSearch}
+                onChange={(e) => setExplorerSearch(e.target.value)}
+                className="w-full px-2 py-1 rounded bg-[#100b1e] border border-purple-500/20 text-xs text-white placeholder-purple-300/30 focus:outline-none focus:border-purple-400"
+              />
+            </div>
+
+            {/* Explorer Services Tree View with Drag and Drop */}
+            <div className="flex-1 overflow-y-auto p-1.5 space-y-1 text-xs font-mono scrollbar-thin">
+              {/* Workspace Root Service */}
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDropOnTarget('workspace')}
+                className="space-y-0.5"
+              >
+                <div
+                  onClick={() => setSelectedItemType('workspace')}
+                  className={`flex items-center justify-between px-2 py-1 rounded cursor-pointer ${
+                    selectedItemType === 'workspace' ? 'bg-purple-600/30 text-purple-200 font-bold' : 'text-purple-300 hover:bg-white/5'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <Boxes className="w-3.5 h-3.5 text-purple-400" />
+                    <span>Workspace</span>
+                  </div>
+                </div>
+
+                {/* Baseplate */}
+                {baseplateEnabled && (
+                  <div
+                    onClick={() => {
+                      setSelectedItemType('baseplate');
+                      setSelectedPartId(null);
+                    }}
+                    className={`flex items-center justify-between pl-6 pr-2 py-1 rounded cursor-pointer ${
+                      selectedItemType === 'baseplate' ? 'bg-purple-600 text-white font-bold shadow-sm' : 'text-purple-400/80 hover:bg-purple-950/40'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <div className="w-2.5 h-2.5 rounded-xs bg-slate-600" />
+                      <span>Baseplate</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Parts in Workspace */}
+                {parts
+                  .filter((p) => (!p.location || p.location === 'workspace') && (!explorerSearch || p.name.toLowerCase().includes(explorerSearch.toLowerCase())))
+                  .map((part) => {
+                    const isSelected = selectedPartId === part.id && selectedItemType === 'part';
+                    const hasScripts = (part.scripts || []).length > 0;
+
+                    return (
+                      <div
+                        key={part.id}
+                        draggable
+                        onDragStart={(e) => handleDragStartItem(e, part.id, 'part')}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          e.stopPropagation();
+                          handleDropOnTarget(part.id);
+                        }}
+                        className="space-y-0.5"
+                      >
+                        <div
+                          onClick={() => {
+                            setSelectedPartId(part.id);
+                            setSelectedItemType('part');
+                          }}
+                          className={`flex items-center justify-between pl-6 pr-2 py-1 rounded-lg cursor-pointer transition-colors group ${
+                            isSelected ? 'bg-purple-600 text-white font-bold shadow-sm' : 'text-purple-200/90 hover:bg-purple-950/40'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 truncate">
+                            <div className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20" style={{ backgroundColor: part.color }} />
+                            <span className="truncate">{part.name}</span>
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100">
+                            {/* Insert Object Dropdown (+ button) */}
+                            <div className="relative">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setInsertObjectMenuPartId((prev) => (prev === part.id ? null : part.id));
+                                }}
+                                className="p-0.5 hover:bg-purple-500/40 rounded text-purple-200 cursor-pointer"
+                                title="Insert Object into Part"
+                              >
+                                <Plus className="w-3 h-3" />
+                              </button>
+                              {insertObjectMenuPartId === part.id && (
+                                <div
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="absolute right-0 top-full mt-1 w-44 bg-[#191130] border border-purple-500/40 rounded-xl shadow-2xl p-1 z-50 animate-fadeIn"
+                                >
+                                  <div className="px-2 py-1 text-[10px] font-bold uppercase text-purple-400/60 border-b border-white/5">
+                                    Insert Object
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      handleAddClickDetectorToPart(part.id);
+                                      setInsertObjectMenuPartId(null);
+                                    }}
+                                    className="w-full px-2 py-1.5 rounded-lg text-left text-xs text-amber-200 hover:bg-amber-950/50 flex items-center gap-2 cursor-pointer font-medium"
+                                  >
+                                    <MousePointer className="w-3.5 h-3.5 text-amber-400" />
+                                    <span>ClickDetector</span>
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      handleAddScriptToPart(part.id);
+                                      setInsertObjectMenuPartId(null);
+                                    }}
+                                    className="w-full px-2 py-1.5 rounded-lg text-left text-xs text-blue-200 hover:bg-blue-950/50 flex items-center gap-2 cursor-pointer font-medium"
+                                  >
+                                    <FileCode className="w-3.5 h-3.5 text-blue-400" />
+                                    <span>Script</span>
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeletePart(part.id);
+                              }}
+                              className="p-0.5 hover:bg-red-500/40 rounded text-red-400 cursor-pointer"
+                              title="Delete Part"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Child ClickDetector in Part */}
+                        {(part.hasClickDetector || part.clickDetector) && (
+                          <div className="pl-10 space-y-0.5">
+                            <div
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedPartId(part.id);
+                                setSelectedItemType('clickdetector');
+                              }}
+                              className={`flex items-center justify-between px-2 py-1 rounded text-[11px] cursor-pointer group ${
+                                selectedPartId === part.id && selectedItemType === 'clickdetector'
+                                  ? 'bg-amber-600 text-white font-bold'
+                                  : 'text-amber-300 bg-amber-950/20 hover:bg-amber-900/30'
+                              }`}
+                            >
+                              <span className="flex items-center gap-1.5 truncate">
+                                <MousePointer className="w-3 h-3 text-amber-400 shrink-0" />
+                                <span className="truncate">ClickDetector</span>
+                              </span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRemoveClickDetectorFromPart(part.id);
+                                }}
+                                className="p-0.5 rounded text-amber-400/60 hover:text-white hover:bg-red-950 opacity-60 group-hover:opacity-100"
+                                title="Delete ClickDetector"
+                              >
+                                <Trash2 className="w-2.5 h-2.5" />
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Child scripts in Part */}
+                        {hasScripts && (
+                          <div className="pl-10 space-y-0.5">
+                            {part.scripts!.map((s) => (
+                              <div
+                                key={s.id}
+                                draggable
+                                onDragStart={(e) => handleDragStartItem(e, s.id, 'script')}
+                                onClick={() => handleOpenScriptEditor(s, part.name)}
+                                className="flex items-center justify-between px-2 py-1 rounded text-[11px] text-blue-300 bg-blue-950/30 hover:bg-blue-900/40 cursor-pointer"
+                              >
+                                <span className="flex items-center gap-1.5 truncate">
+                                  <FileCode className="w-3 h-3 shrink-0" />
+                                  <span className="truncate">{s.name}.lua</span>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+              </div>
+
+              {/* ReplicatedStorage Folder */}
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDropOnTarget('replicatedstorage')}
+                className="pt-1 border-t border-purple-500/10 space-y-0.5"
+              >
+                <div className="flex items-center justify-between px-2 py-1 rounded text-amber-300 font-bold bg-amber-950/20">
+                  <div className="flex items-center gap-1.5">
+                    <Folder className="w-3.5 h-3.5 text-amber-400" />
+                    <span>ReplicatedStorage</span>
+                  </div>
+                </div>
+                {/* Parts in ReplicatedStorage */}
+                {parts
+                  .filter((p) => p.location === 'replicatedstorage')
+                  .map((p) => (
                     <div
+                      key={p.id}
+                      draggable
+                      onDragStart={(e) => handleDragStartItem(e, p.id, 'part')}
                       onClick={() => {
-                        setSelectedPartId(part.id);
+                        setSelectedPartId(p.id);
                         setSelectedItemType('part');
                       }}
-                      className={`flex items-center justify-between pl-6 pr-2 py-1.5 rounded-lg cursor-pointer transition-colors group ${
-                        isSelected ? 'bg-purple-600 text-white font-bold shadow-sm' : 'text-purple-200/90 hover:bg-purple-950/40'
-                      }`}
+                      className="pl-6 pr-2 py-1 rounded text-amber-200/80 hover:bg-amber-900/30 cursor-pointer flex items-center justify-between"
                     >
-                      <div className="flex items-center gap-1.5 truncate">
-                        <div className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20" style={{ backgroundColor: part.color }} />
-                        <span className="truncate">{part.name}</span>
-                      </div>
-
-                      <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleAddScriptToPart(part.id);
-                          }}
-                          className="p-1 hover:bg-purple-500/40 rounded text-blue-300"
-                          title="Add Script to Part"
-                        >
-                          <Plus className="w-3 h-3" />
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeletePart(part.id);
-                          }}
-                          className="p-1 hover:bg-red-500/40 rounded text-red-400"
-                          title="Delete Part"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
-                      </div>
+                      <span>{p.name}</span>
                     </div>
+                  ))}
+              </div>
 
-                    {/* Attached Scripts child list */}
-                    {hasScripts && isExpanded && (
-                      <div className="pl-10 space-y-0.5">
-                        {part.scripts!.map((s) => (
-                          <div
-                            key={s.id}
-                            onClick={() => handleOpenScriptEditor(s, part.name)}
-                            className="flex items-center justify-between px-2 py-1 rounded text-[11px] text-blue-300 bg-blue-950/30 hover:bg-blue-900/40 cursor-pointer"
-                          >
-                            <span className="flex items-center gap-1.5 truncate">
-                              <FileCode className="w-3 h-3" />
-                              <span className="truncate">{s.name}.lua</span>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-
-              {/* ServerScriptService Folder */}
-              <div className="pt-2 border-t border-purple-500/10 space-y-0.5">
+              {/* ServerScriptService Service */}
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDropOnTarget('serverscriptservice')}
+                className="pt-1 border-t border-purple-500/10 space-y-0.5"
+              >
                 <div
                   onClick={() => setSelectedItemType('serverscriptservice')}
                   className={`flex items-center justify-between px-2 py-1 rounded cursor-pointer ${
-                    selectedItemType === 'serverscriptservice' ? 'bg-purple-600/30 text-purple-200 font-bold' : 'text-purple-300'
+                    selectedItemType === 'serverscriptservice' ? 'bg-purple-600/30 text-purple-200 font-bold' : 'text-purple-300 hover:bg-white/5'
                   }`}
                 >
                   <div className="flex items-center gap-1.5">
@@ -2561,8 +3357,8 @@ part.Touched:Connect(onTouch)`,
                       e.stopPropagation();
                       handleAddServerScript();
                     }}
-                    className="p-1 hover:bg-blue-500/40 rounded text-blue-300"
-                    title="Add Script to ServerScriptService"
+                    className="p-0.5 hover:bg-blue-500/40 rounded text-blue-300 cursor-pointer"
+                    title="Add Server Script"
                   >
                     <Plus className="w-3 h-3" />
                   </button>
@@ -2573,16 +3369,48 @@ part.Touched:Connect(onTouch)`,
                   {serverScripts.map((s) => (
                     <div
                       key={s.id}
+                      draggable
+                      onDragStart={(e) => handleDragStartItem(e, s.id, 'script')}
                       onClick={() => handleOpenScriptEditor(s, 'ServerScriptService')}
                       className="flex items-center justify-between px-2 py-1 rounded text-[11px] text-blue-300 bg-blue-950/30 hover:bg-blue-900/40 cursor-pointer"
                     >
                       <span className="flex items-center gap-1.5 truncate">
-                        <FileCode className="w-3 h-3" />
+                        <FileCode className="w-3 h-3 shrink-0" />
                         <span className="truncate">{s.name}.lua</span>
                       </span>
                     </div>
                   ))}
                 </div>
+              </div>
+
+              {/* ServerStorage Folder */}
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDropOnTarget('serverstorage')}
+                className="pt-1 border-t border-purple-500/10 space-y-0.5"
+              >
+                <div className="flex items-center justify-between px-2 py-1 rounded text-purple-300 font-bold bg-purple-950/20">
+                  <div className="flex items-center gap-1.5">
+                    <Folder className="w-3.5 h-3.5 text-purple-400" />
+                    <span>ServerStorage</span>
+                  </div>
+                </div>
+                {parts
+                  .filter((p) => p.location === 'serverstorage')
+                  .map((p) => (
+                    <div
+                      key={p.id}
+                      draggable
+                      onDragStart={(e) => handleDragStartItem(e, p.id, 'part')}
+                      onClick={() => {
+                        setSelectedPartId(p.id);
+                        setSelectedItemType('part');
+                      }}
+                      className="pl-6 pr-2 py-1 rounded text-purple-200/80 hover:bg-purple-900/30 cursor-pointer flex items-center justify-between"
+                    >
+                      <span>{p.name}</span>
+                    </div>
+                  ))}
               </div>
             </div>
           </div>

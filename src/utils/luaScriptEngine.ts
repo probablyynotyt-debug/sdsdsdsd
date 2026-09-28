@@ -229,6 +229,7 @@ export class LuaScriptRunner {
   private abortControllers: AbortController[] = [];
   private activeTweens: ActiveTween[] = [];
   private touchedListeners: Map<string, Array<(hit: any) => void>> = new Map();
+  private clickListeners: Map<string, Array<(player: any) => void>> = new Map();
   private context: ScriptRuntimeContext | null = null;
   private animFrameId: number | null = null;
 
@@ -244,6 +245,7 @@ export class LuaScriptRunner {
     this.stop();
     this.isRunning = true;
     this.touchedListeners.clear();
+    this.clickListeners.clear();
     this.activeTweens = [];
 
     const partsMap = new Map<string, StudioPart>();
@@ -275,12 +277,42 @@ export class LuaScriptRunner {
     }
     this.abortControllers = [];
     this.touchedListeners.clear();
+    this.clickListeners.clear();
     this.activeTweens = [];
     if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;
     }
     this.context = null;
+  }
+
+  public hasClickDetector(partId: string): boolean {
+    if (this.context) {
+      const part = this.context.parts.get(partId);
+      if (part?.hasClickDetector) return true;
+    }
+    const list = this.clickListeners.get(partId);
+    return !!(list && list.length > 0);
+  }
+
+  public triggerClick(partId: string, playerProxy?: any) {
+    if (!this.isRunning) return;
+    const listeners = this.clickListeners.get(partId);
+    if (listeners && listeners.length > 0) {
+      const p = playerProxy || (this.context ? createHumanoidHitProxy(this.context.humanoid).Parent : null);
+      for (const cb of listeners) {
+        try {
+          cb(p);
+        } catch (e: any) {
+          this.context?.onLog({
+            id: Math.random().toString(36).slice(2),
+            type: 'error',
+            message: `Runtime Error in MouseClick: ${e?.message || e}`,
+            timestamp: Date.now(),
+          });
+        }
+      }
+    }
   }
 
   public triggerTouched(partId: string, hitObject: any) {
@@ -633,8 +665,64 @@ export class LuaScriptRunner {
           part.material = val as any;
           ctx.onPartUpdated?.(pId, { material: part.material });
         },
-        FindFirstChild: (n: string) => null,
-        findFirstChild: (n: string) => null,
+        _partId: pId,
+        ClickDetector: {
+          Name: 'ClickDetector',
+          ClassName: 'ClickDetector',
+          MaxActivationDistance: 32,
+          CursorIcon: '',
+          MouseClick: {
+            Connect: (callback: (player: any) => void) => {
+              let listeners = this.clickListeners.get(pId);
+              if (!listeners) {
+                listeners = [];
+                this.clickListeners.set(pId, listeners);
+              }
+              listeners.push(callback);
+              return {
+                Disconnect: () => {
+                  const arr = this.clickListeners.get(pId);
+                  if (arr) {
+                    const idx = arr.indexOf(callback);
+                    if (idx !== -1) arr.splice(idx, 1);
+                  }
+                },
+              };
+            },
+            connect: (callback: (player: any) => void) => proxy.ClickDetector.MouseClick.Connect(callback),
+          },
+          MouseHoverEnter: {
+            Connect: () => ({ Disconnect: () => {} }),
+            connect: () => ({ Disconnect: () => {} }),
+          },
+          MouseHoverLeave: {
+            Connect: () => ({ Disconnect: () => {} }),
+            connect: () => ({ Disconnect: () => {} }),
+          },
+          RightMouseClick: {
+            Connect: (callback: (player: any) => void) => proxy.ClickDetector.MouseClick.Connect(callback),
+            connect: (callback: (player: any) => void) => proxy.ClickDetector.MouseClick.Connect(callback),
+          },
+        },
+        get clickDetector() {
+          return proxy.ClickDetector;
+        },
+        FindFirstChild: (n: string) => {
+          const lower = (n || '').toLowerCase();
+          if (lower === 'clickdetector') return proxy.ClickDetector;
+          if (lower === 'humanoid') return null;
+          return null;
+        },
+        findFirstChild: (n: string) => proxy.FindFirstChild(n),
+        FindFirstChildOfClass: (c: string) => {
+          if ((c || '').toLowerCase() === 'clickdetector') return proxy.ClickDetector;
+          return null;
+        },
+        findFirstChildOfClass: (c: string) => proxy.FindFirstChildOfClass(c),
+        FindFirstChildWhichIsA: (c: string) => proxy.FindFirstChildOfClass(c),
+        findFirstChildWhichIsA: (c: string) => proxy.FindFirstChildOfClass(c),
+        WaitForChild: (n: string) => proxy.FindFirstChild(n),
+        waitForChild: (n: string) => proxy.FindFirstChild(n),
         Touched: {
           Connect: (callback: (hit: any) => void) => {
             let listeners = this.touchedListeners.get(pId);
@@ -655,10 +743,15 @@ export class LuaScriptRunner {
           },
         },
         Destroy: () => {
+          part.transparency = 1;
+          part.canCollide = false;
           const mesh = ctx.meshes.get(pId);
-          if (mesh && mesh.parent) mesh.parent.remove(mesh);
-          ctx.parts.delete(pId);
+          if (mesh) {
+            mesh.visible = false;
+          }
+          ctx.onPartUpdated?.(pId, { transparency: 1, canCollide: false });
         },
+        destroy: () => proxy.Destroy(),
         TweenPosition: (targetPos: any, easingDir = 'InOut', easingStyle = 'Quad', time = 1) => {
           const tween = TweenService.Create(
             proxy,
@@ -708,11 +801,13 @@ export class LuaScriptRunner {
 
     const TweenService = {
       Create: (partObj: any, tweenInfo: any, goals: any) => {
-        let targetPartId = scriptParentPartId;
-        for (const [id, p] of ctx.parts.entries()) {
-          if (p.name === partObj?.Name || partObj === createPartProxy(p, id)) {
-            targetPartId = id;
-            break;
+        let targetPartId = partObj?._partId || scriptParentPartId;
+        if (!ctx.parts.has(targetPartId)) {
+          for (const [id, p] of ctx.parts.entries()) {
+            if (p.name === partObj?.Name || partObj?.name === p.name) {
+              targetPartId = id;
+              break;
+            }
           }
         }
 
@@ -890,6 +985,62 @@ export class LuaScriptRunner {
     try {
       const jsCode = this.transpileLuaToJS(script.code);
 
+      const instanceProxy = {
+        new: (className: string, parent?: any) => {
+          const cName = (className || '').toLowerCase();
+          if (cName === 'clickdetector') {
+            const pId = parent?._partId || scriptParentPartId;
+            const cd = {
+              Name: 'ClickDetector',
+              ClassName: 'ClickDetector',
+              MaxActivationDistance: 32,
+              MouseClick: {
+                Connect: (callback: any) => {
+                  let listeners = this.clickListeners.get(pId);
+                  if (!listeners) {
+                    listeners = [];
+                    this.clickListeners.set(pId, listeners);
+                  }
+                  listeners.push(callback);
+                  return {
+                    Disconnect: () => {
+                      const arr = this.clickListeners.get(pId);
+                      if (arr) {
+                        const idx = arr.indexOf(callback);
+                        if (idx !== -1) arr.splice(idx, 1);
+                      }
+                    },
+                  };
+                },
+                connect: (callback: any) => cd.MouseClick.Connect(callback),
+              },
+              MouseHoverEnter: {
+                Connect: () => ({ Disconnect: () => {} }),
+                connect: () => ({ Disconnect: () => {} }),
+              },
+              MouseHoverLeave: {
+                Connect: () => ({ Disconnect: () => {} }),
+                connect: () => ({ Disconnect: () => {} }),
+              },
+              RightMouseClick: {
+                Connect: (cb: any) => cd.MouseClick.Connect(cb),
+                connect: (cb: any) => cd.MouseClick.Connect(cb),
+              },
+            };
+            if (parent && parent._partId) {
+              parent.ClickDetector = cd;
+              const p = ctx.parts.get(pId);
+              if (p) {
+                p.hasClickDetector = true;
+                ctx.onPartUpdated?.(pId, { hasClickDetector: true });
+              }
+            }
+            return cd;
+          }
+          return { Name: className, ClassName: className };
+        },
+      };
+
       const sandboxFunction = new Function(
         'script',
         'workspace',
@@ -908,6 +1059,7 @@ export class LuaScriptRunner {
         'math',
         'string',
         'table',
+        'Instance',
         'abortSignal',
         `return (async () => {\n${jsCode}\n})();`
       );
@@ -1020,6 +1172,7 @@ export class LuaScriptRunner {
         mathProxy,
         String,
         { insert: (arr: any[], v: any) => arr.push(v), remove: (arr: any[], i: number) => arr.splice(i - 1, 1) },
+        instanceProxy,
         abortController.signal
       ).catch((err: any) => {
         if (!abortController.signal.aborted) {
@@ -1064,7 +1217,17 @@ export class LuaScriptRunner {
       return `{${convertedBody}}`;
     });
 
-    // 4. Keywords
+    // 4. Function definitions (MUST run BEFORE local -> let!)
+    // local function Name(args) -> async function Name(args) {
+    code = code.replace(/\blocal\s+function\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)/g, 'async function $1($2) {');
+
+    // function Name(args) (when NOT preceded by async) -> async function Name(args) {
+    code = code.replace(/(?<!async\s+)\bfunction\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)/g, 'async function $1($2) {');
+
+    // Anonymous function(args) or function (args) (when NOT preceded by async)
+    code = code.replace(/(?<!async\s+)\bfunction\s*\(([^)]*)\)/g, 'async function($1) {');
+
+    // 5. Keywords
     code = code.replace(/\bnil\b/g, 'null');
     code = code.replace(/~=/g, '!==');
     code = code.replace(/\bnot\b/g, '!');
@@ -1072,7 +1235,7 @@ export class LuaScriptRunner {
     code = code.replace(/\bor\b/g, '||');
     code = code.replace(/\blocal\b/g, 'let');
 
-    // 5. Loops & Conditionals
+    // 6. Loops & Conditionals
     // while <cond> do
     code = code.replace(
       /\bwhile\s+([\s\S]+?)\s+do\b/g,
@@ -1097,20 +1260,21 @@ export class LuaScriptRunner {
     // else
     code = code.replace(/\belse\b/g, '} else {');
 
-    // function Name(args) -> async function Name(args) {
-    code = code.replace(/\bfunction\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)/g, 'async function $1($2) {');
-
-    // function(args) -> async function(args) {
-    code = code.replace(/\bfunction\s*\(([^)]*)\)/g, 'async function($1) {');
+    // end) -> })
+    code = code.replace(/\bend\s*\)/g, '})');
 
     // end -> }
     code = code.replace(/\bend\b/g, '}');
 
-    // 6. Async waits
+    // 7. Vector3 arithmetic helper: .Position + Vector3.new(...) -> .Position.add(Vector3.new(...))
+    code = code.replace(/([a-zA-Z0-9_.)\]]+)\s*\+\s*(Vector3\.new\([^)]*\))/g, '$1.add($2)');
+    code = code.replace(/([a-zA-Z0-9_.)\]]+)\s*-\s*(Vector3\.new\([^)]*\))/g, '$1.sub($2)');
+
+    // 8. Async waits
     code = code.replace(/\b(?<!await\s+)task\.wait\b/g, 'await task.wait');
     code = code.replace(/\b(?<!await\s+)wait\b/g, 'await wait');
 
-    // 7. Handle string concatenation .. -> +
+    // 9. Handle string concatenation .. -> +
     code = code.replace(/\s*\.\.\s*/g, ' + ');
 
     return code;
@@ -1210,6 +1374,23 @@ end
 part.Touched:Connect(onTouch)`,
   },
   {
+    name: 'Click to Disappear Part (ClickDetector)',
+    description: 'When clicked by player mouse, part becomes invisible and non-collidable, then reappears',
+    code: `local part = script.Parent
+local clickDetector = part:FindFirstChild("ClickDetector") or part.ClickDetector
+
+local function onClick(player)
+    print("Part clicked! Disappearing...")
+    part.Transparency = 1
+    part.CanCollide = false
+    task.wait(3)
+    part.Transparency = 0
+    part.CanCollide = true
+end
+
+clickDetector.MouseClick:Connect(onClick)`,
+  },
+  {
     name: 'Color Cycle Disco Part',
     description: 'Cycles through random bright neon disco colors',
     code: `local part = script.Parent
@@ -1219,4 +1400,28 @@ while true do
     task.wait(0.4)
 end`,
   },
+];
+
+export const LUA_AUTOCOMPLETE_ITEMS = [
+  { label: 'script.Parent', type: 'property', desc: 'The parent part or service containing this script' },
+  { label: 'script.Parent.ClickDetector', type: 'object', desc: 'ClickDetector instance for mouse clicks' },
+  { label: 'ClickDetector.MouseClick:Connect(function(player))', type: 'method', desc: 'Fires when player clicks this part' },
+  { label: 'script.Parent.Touched:Connect(function(hit))', type: 'method', desc: 'Fires when part is touched by avatar' },
+  { label: 'humanoid.Health = 0', type: 'property', desc: 'Sets player health (0 kills avatar)' },
+  { label: 'humanoid.WalkSpeed = 36', type: 'property', desc: 'Sets player walking speed' },
+  { label: 'humanoid.JumpPower = 90', type: 'property', desc: 'Sets player jump power' },
+  { label: 'part.Transparency = 1', type: 'property', desc: 'Makes part completely invisible (0 to 1)' },
+  { label: 'part.CanCollide = false', type: 'property', desc: 'Disables collision so player walks through' },
+  { label: 'part.Position = Vector3.new(x, y, z)', type: 'property', desc: 'Sets 3D position of part' },
+  { label: 'part.Orientation = Vector3.new(x, y, z)', type: 'property', desc: 'Sets 3D rotation angles' },
+  { label: 'part.Color = Color3.fromRGB(r, g, b)', type: 'property', desc: 'Sets part RGB color' },
+  { label: 'part:Destroy()', type: 'method', desc: 'Destroys/removes part from game' },
+  { label: 'task.wait(seconds)', type: 'function', desc: 'Yields script execution for specified duration' },
+  { label: 'game:GetService("TweenService")', type: 'function', desc: 'Retrieves TweenService for smooth animations' },
+  { label: 'game:GetService("Workspace")', type: 'function', desc: 'Retrieves Workspace service' },
+  { label: 'game:GetService("ReplicatedStorage")', type: 'function', desc: 'Retrieves ReplicatedStorage' },
+  { label: 'Instance.new("ClickDetector", part)', type: 'function', desc: 'Creates a new ClickDetector and parents it to part' },
+  { label: 'Vector3.new(x, y, z)', type: 'constructor', desc: 'Constructs 3D Vector' },
+  { label: 'Color3.fromRGB(r, g, b)', type: 'constructor', desc: 'Constructs Color3 from 0-255 RGB values' },
+  { label: 'print(...)', type: 'function', desc: 'Prints message to Studio Output terminal' },
 ];

@@ -573,6 +573,8 @@ export default function BaseplateGame({
   const ragdollManagerRef = useRef<RagdollShatterManager>(new RagdollShatterManager());
   const remoteRagdollsRef = useRef<Map<string, RagdollShatterManager>>(new Map());
   const remotePrevDeadRef = useRef<Map<string, boolean>>(new Map());
+  const prevMeshPositionsRef = useRef<Map<string, THREE.Vector3>>(new Map());
+  const lastStandingPartIdRef = useRef<string | null>(null);
   const lastBroadcastMovingRef = useRef<boolean>(false);
   const lastBroadcastJumpingRef = useRef<boolean>(false);
 
@@ -721,6 +723,7 @@ export default function BaseplateGame({
       const jumpVelocity = (jumpPower / 50) * 15.5;
       playerVelocityYRef.current = jumpVelocity;
       isGroundedRef.current = false;
+      lastStandingPartIdRef.current = null;
       gameAudio.playJumpSound();
 
       // Immediately broadcast jumping state
@@ -1236,25 +1239,85 @@ export default function BaseplateGame({
       if (e.button === 0 || e.button === 2) {
         isDraggingRef.current = true;
         prevMousePosRef.current = { x: e.clientX, y: e.clientY };
+
+        // Raycast for ClickDetector interactions in 3D world
+        if (e.button === 0 && camera) {
+          const rect = containerRef.current?.getBoundingClientRect();
+          if (rect) {
+            const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+            const meshes = Array.from(partMeshesMapRef.current.values());
+            const intersects = raycaster.intersectObjects(meshes, true);
+            if (intersects.length > 0) {
+              const hitMesh = intersects[0].object as THREE.Mesh;
+              for (const [pId, m] of partMeshesMapRef.current.entries()) {
+                if (m === hitMesh || m.children.includes(hitMesh)) {
+                  const partObj = currentPartsList.find((p) => p.id === pId);
+                  if (
+                    partObj?.hasClickDetector ||
+                    partObj?.clickDetector ||
+                    luaRunnerRef.current.hasClickDetector(pId) ||
+                    (partObj?.scripts && partObj.scripts.some((s) => s.code.includes('ClickDetector') || s.code.includes('MouseClick')))
+                  ) {
+                    const hitProxy = createHumanoidHitProxy(humanoidProxyRef.current);
+                    luaRunnerRef.current.triggerClick(pId, hitProxy.Parent);
+                    gameAudio.playClickSound();
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
       }
     };
 
     const onMouseMove = (e: MouseEvent) => {
-      if (isPausedRef.current || !isDraggingRef.current) return;
-      const dx = e.clientX - prevMousePosRef.current.x;
-      const dy = e.clientY - prevMousePosRef.current.y;
-      prevMousePosRef.current = { x: e.clientX, y: e.clientY };
+      if (isPausedRef.current) return;
+      if (isDraggingRef.current) {
+        const dx = e.clientX - prevMousePosRef.current.x;
+        const dy = e.clientY - prevMousePosRef.current.y;
+        prevMousePosRef.current = { x: e.clientX, y: e.clientY };
 
-      const sens = 0.005;
-      const xFactor = invertXRef.current ? -1 : 1;
-      const yFactor = invertYRef.current ? -1 : 1;
+        const sens = 0.005;
+        const xFactor = invertXRef.current ? -1 : 1;
+        const yFactor = invertYRef.current ? -1 : 1;
 
-      cameraYawRef.current -= dx * sens * xFactor;
-      cameraPitchRef.current = THREE.MathUtils.clamp(
-        cameraPitchRef.current + dy * sens * yFactor,
-        -1.15,
-        1.25
-      );
+        cameraYawRef.current -= dx * sens * xFactor;
+        cameraPitchRef.current = THREE.MathUtils.clamp(
+          cameraPitchRef.current + dy * sens * yFactor,
+          -1.15,
+          1.25
+        );
+      } else if (camera && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
+        const meshes = Array.from(partMeshesMapRef.current.values());
+        const intersects = raycaster.intersectObjects(meshes, true);
+        let hoverDetector = false;
+        if (intersects.length > 0) {
+          const hitMesh = intersects[0].object as THREE.Mesh;
+          for (const [pId, m] of partMeshesMapRef.current.entries()) {
+            if (m === hitMesh || m.children.includes(hitMesh)) {
+              const partObj = currentPartsList.find((p) => p.id === pId);
+              if (
+                partObj?.hasClickDetector ||
+                luaRunnerRef.current.hasClickDetector(pId) ||
+                (partObj?.scripts && partObj.scripts.some((s) => s.code.includes('ClickDetector') || s.code.includes('MouseClick')))
+              ) {
+                hoverDetector = true;
+              }
+              break;
+            }
+          }
+        }
+        containerRef.current.style.cursor = hoverDetector ? 'pointer' : 'default';
+      }
     };
 
     const onMouseUp = () => {
@@ -1539,44 +1602,90 @@ export default function BaseplateGame({
           playerHeadingRef.current = Math.atan2(moveDirX, moveDirZ);
         }
 
-        // 3. Ground & Gravity
+        // 3. Ground & Moving Platform Delta Transfer (carry player along with moving platforms)
+        if (lastStandingPartIdRef.current) {
+          const entry = currentPartMeshes.find((m) => m.part.id === lastStandingPartIdRef.current);
+          if (entry) {
+            const currPos = entry.mesh.position;
+            const prevPos = prevMeshPositionsRef.current.get(lastStandingPartIdRef.current);
+            if (prevPos) {
+              const dx = currPos.x - prevPos.x;
+              const dz = currPos.z - prevPos.z;
+              if (Math.abs(dx) > 0.00001 || Math.abs(dz) > 0.00001) {
+                playerPosRef.current.x += dx;
+                playerPosRef.current.z += dz;
+              }
+            }
+            // Elevators and moving platforms lift player upwards directly
+            const halfX = entry.part.size[0] / 2 + 0.9;
+            const halfZ = entry.part.size[2] / 2 + 0.9;
+            const halfY = entry.part.size[1] / 2;
+            const partTop = currPos.y + halfY;
+            const isOver =
+              playerPosRef.current.x >= currPos.x - halfX &&
+              playerPosRef.current.x <= currPos.x + halfX &&
+              playerPosRef.current.z >= currPos.z - halfZ &&
+              playerPosRef.current.z <= currPos.z + halfZ;
+
+            if (isOver && playerVelocityYRef.current <= 0.5 && playerPosRef.current.y <= partTop + 0.8 && playerPosRef.current.y >= partTop - 3.5) {
+              playerPosRef.current.y = partTop;
+              playerVelocityYRef.current = 0;
+              isGroundedRef.current = true;
+            }
+          }
+        }
+
+        // Record current mesh positions for all parts for next frame delta
+        currentPartMeshes.forEach(({ part, mesh }) => {
+          prevMeshPositionsRef.current.set(part.id, mesh.position.clone());
+        });
+
+        // Compute ground height and standing part
         let floorY = 0;
-        const charRadius = 0.7;
+        let standingPartId: string | null = null;
+        const charRadius = 0.8;
 
         currentPartsList.forEach((part) => {
           if (part.canCollide !== false) {
-            const currentPartY = !part.anchored
-              ? currentPartMeshes.find((m) => m.part.id === part.id)?.currentY || part.position[1]
-              : part.position[1];
+            const entryMesh = currentPartMeshes.find((m) => m.part.id === part.id)?.mesh;
+            const currentPartX = entryMesh ? entryMesh.position.x : part.position[0];
+            const currentPartY = entryMesh ? entryMesh.position.y : part.position[1];
+            const currentPartZ = entryMesh ? entryMesh.position.z : part.position[2];
 
             const halfX = part.size[0] / 2;
             const halfY = part.size[1] / 2;
             const halfZ = part.size[2] / 2;
-            const pX = part.position[0];
-            const pZ = part.position[2];
             const partTop = currentPartY + halfY;
 
             if (
-              playerPosRef.current.x >= pX - halfX - charRadius &&
-              playerPosRef.current.x <= pX + halfX + charRadius &&
-              playerPosRef.current.z >= pZ - halfZ - charRadius &&
-              playerPosRef.current.z <= pZ + halfZ + charRadius
+              playerPosRef.current.x >= currentPartX - halfX - charRadius &&
+              playerPosRef.current.x <= currentPartX + halfX + charRadius &&
+              playerPosRef.current.z >= currentPartZ - halfZ - charRadius &&
+              playerPosRef.current.z <= currentPartZ + halfZ + charRadius
             ) {
-              if (playerPosRef.current.y >= partTop - 2.0) {
-                floorY = Math.max(floorY, partTop);
+              if (playerPosRef.current.y >= partTop - 2.5) {
+                if (partTop >= floorY) {
+                  floorY = partTop;
+                  standingPartId = part.id;
+                }
               }
             }
           }
         });
 
-        playerVelocityYRef.current -= 34 * delta;
-        playerPosRef.current.y += playerVelocityYRef.current * delta;
+        lastStandingPartIdRef.current = standingPartId;
+
+        // Apply gravity if in the air or jumping
+        if (!isGroundedRef.current || playerVelocityYRef.current > 0.1) {
+          playerVelocityYRef.current -= 34 * delta;
+          playerPosRef.current.y += playerVelocityYRef.current * delta;
+        }
 
         if (playerPosRef.current.y <= floorY + 0.2) {
           playerPosRef.current.y = floorY;
           playerVelocityYRef.current = 0;
           isGroundedRef.current = true;
-        } else {
+        } else if (playerVelocityYRef.current > 0.1) {
           isGroundedRef.current = false;
         }
 

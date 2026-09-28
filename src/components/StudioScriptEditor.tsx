@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   FileCode,
   Play,
@@ -10,10 +10,12 @@ import {
   AlertCircle,
   Copy,
   Terminal,
-  Trash2
+  Trash2,
+  Zap,
+  Code
 } from 'lucide-react';
 import { StudioScript } from '../types/experience';
-import { LUA_PRESET_TEMPLATES, ScriptLogMessage } from '../utils/luaScriptEngine';
+import { LUA_PRESET_TEMPLATES, LUA_AUTOCOMPLETE_ITEMS, ScriptLogMessage } from '../utils/luaScriptEngine';
 
 interface StudioScriptEditorProps {
   script: StudioScript;
@@ -22,6 +24,7 @@ interface StudioScriptEditorProps {
   onClose: () => void;
   logs?: ScriptLogMessage[];
   onClearLogs?: () => void;
+  embedded?: boolean;
 }
 
 export default function StudioScriptEditor({
@@ -31,6 +34,7 @@ export default function StudioScriptEditor({
   onClose,
   logs = [],
   onClearLogs,
+  embedded = false,
 }: StudioScriptEditorProps) {
   const [code, setCode] = useState(script.code || '');
   const [scriptName, setScriptName] = useState(script.name || 'Script');
@@ -39,19 +43,88 @@ export default function StudioScriptEditor({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [activeTab, setActiveTab] = useState<'editor' | 'output'>('editor');
 
+  // Intellisense Autocomplete State
+  const [autocompleteFilter, setAutocompleteFilter] = useState<string>('');
+  const [showAutocomplete, setShowAutocomplete] = useState<boolean>(false);
+  const [selectedIndex, setSelectedIndex] = useState<number>(0);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
   const handleSave = () => {
-    onSaveScript({
+    const updated = {
       ...script,
       name: scriptName.trim() || 'Script',
       code,
-    });
+    };
+    onSaveScript(updated);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 2000);
+  };
+
+  const handleCodeChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setCode(val);
+
+    // Sync live with parent
+    onSaveScript({
+      ...script,
+      name: scriptName.trim() || 'Script',
+      code: val,
+    });
+
+    // Determine current word for autocomplete
+    const cursorPos = e.target.selectionStart || 0;
+    const textBeforeCursor = val.slice(0, cursorPos);
+    const words = textBeforeCursor.split(/[\s\(\)\,\:\;\=\+\-\*\/]+/);
+    const lastWord = words[words.length - 1] || '';
+
+    if (lastWord.length >= 2) {
+      setAutocompleteFilter(lastWord.toLowerCase());
+      setShowAutocomplete(true);
+      setSelectedIndex(0);
+    } else {
+      setShowAutocomplete(false);
+    }
+  };
+
+  const matchingSuggestions = LUA_AUTOCOMPLETE_ITEMS.filter((item) =>
+    item.label.toLowerCase().includes(autocompleteFilter)
+  ).slice(0, 7);
+
+  const handleSelectSuggestion = (suggestionText: string) => {
+    if (!textareaRef.current) return;
+    const textarea = textareaRef.current;
+    const cursorPos = textarea.selectionStart || 0;
+    const textBefore = code.slice(0, cursorPos);
+    const textAfter = code.slice(cursorPos);
+
+    const words = textBefore.split(/([\s\(\)\,\:\;\=\+\-\*\/]+)/);
+    words.pop(); // remove incomplete word
+    const newTextBefore = words.join('') + suggestionText;
+    const newCode = newTextBefore + textAfter;
+
+    setCode(newCode);
+    setShowAutocomplete(false);
+
+    onSaveScript({
+      ...script,
+      name: scriptName.trim() || 'Script',
+      code: newCode,
+    });
+
+    setTimeout(() => {
+      textarea.focus();
+      textarea.selectionStart = textarea.selectionEnd = newTextBefore.length;
+    }, 50);
   };
 
   const handleApplyTemplate = (tmplCode: string) => {
     setCode(tmplCode);
     setTemplateDropdownOpen(false);
+    onSaveScript({
+      ...script,
+      name: scriptName.trim() || 'Script',
+      code: tmplCode,
+    });
   };
 
   const handleCopyCode = () => {
@@ -61,30 +134,41 @@ export default function StudioScriptEditor({
   };
 
   const lineCount = code.split('\n').length;
-  const lineNumbers = Array.from({ length: Math.max(lineCount, 12) }, (_, i) => i + 1);
+  const lineNumbers = Array.from({ length: Math.max(lineCount, 16) }, (_, i) => i + 1);
+
+  const containerClasses = embedded
+    ? 'w-full h-full bg-[#181228] flex flex-col overflow-hidden text-slate-100 font-sans'
+    : 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn';
+
+  const innerClasses = embedded
+    ? 'w-full h-full flex flex-col overflow-hidden bg-[#181228]'
+    : 'relative w-full max-w-4xl h-[85vh] bg-[#1a1429] border border-purple-500/40 rounded-2xl shadow-2xl flex flex-col overflow-hidden';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
-      <div className="relative w-full max-w-4xl h-[85vh] bg-[#1a1429] border border-purple-500/40 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+    <div className={containerClasses}>
+      <div className={innerClasses}>
         {/* Top Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 bg-[#120d20] border-b border-white/10">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-blue-600/30 border border-blue-400/40 flex items-center justify-center text-blue-400">
-              <FileCode className="w-4 h-4" />
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#120d20] border-b border-white/10 shrink-0 select-none">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-blue-600/30 border border-blue-400/40 flex items-center justify-center text-blue-400 shrink-0">
+              <FileCode className="w-3.5 h-3.5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 <input
                   type="text"
                   value={scriptName}
-                  onChange={(e) => setScriptName(e.target.value)}
-                  className="bg-transparent text-sm font-bold text-white border-b border-transparent hover:border-white/20 focus:border-purple-400 focus:outline-none px-1"
+                  onChange={(e) => {
+                    setScriptName(e.target.value);
+                    onSaveScript({ ...script, name: e.target.value.trim() || 'Script', code });
+                  }}
+                  className="bg-transparent text-xs font-bold text-white border-b border-transparent hover:border-white/20 focus:border-purple-400 focus:outline-none px-1"
                 />
-                <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 font-mono font-bold">
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-mono font-bold">
                   .lua
                 </span>
               </div>
-              <p className="text-[11px] text-white/50 px-1">
+              <p className="text-[10px] text-white/50 px-1">
                 Parent: <span className="text-purple-300 font-semibold">{parentName}</span>
               </p>
             </div>
@@ -95,10 +179,10 @@ export default function StudioScriptEditor({
             <div className="relative">
               <button
                 onClick={() => setTemplateDropdownOpen((prev) => !prev)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-white/90 text-xs font-semibold transition-colors cursor-pointer"
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-white/90 text-xs font-semibold transition-colors cursor-pointer"
               >
-                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                <span>Script Templates</span>
+                <Sparkles className="w-3 h-3 text-amber-400" />
+                <span>Templates</span>
                 <ChevronDown className="w-3 h-3 opacity-60" />
               </button>
 
@@ -127,61 +211,63 @@ export default function StudioScriptEditor({
 
             <button
               onClick={handleCopyCode}
-              className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition-colors cursor-pointer"
+              className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition-colors cursor-pointer"
               title="Copy Lua Code"
             >
-              {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
 
             <button
               onClick={handleSave}
-              className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all shadow-md cursor-pointer"
+              className="flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all shadow-md cursor-pointer"
             >
-              {savedSuccess ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
-              <span>{savedSuccess ? 'Saved!' : 'Save Script'}</span>
+              {savedSuccess ? <Check className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+              <span>{savedSuccess ? 'Saved!' : 'Save'}</span>
             </button>
 
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-lg bg-white/5 hover:bg-white/15 text-white/70 hover:text-white transition-colors cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            {!embedded && (
+              <button
+                onClick={onClose}
+                className="p-1.5 rounded-lg bg-white/5 hover:bg-white/15 text-white/70 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
 
         {/* View Tabs */}
-        <div className="flex items-center px-4 bg-[#140e24] border-b border-white/5">
+        <div className="flex items-center px-3 bg-[#140e24] border-b border-white/5 shrink-0">
           <button
             onClick={() => setActiveTab('editor')}
-            className={`px-3.5 py-2 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
               activeTab === 'editor'
                 ? 'border-purple-400 text-purple-300 bg-purple-900/20'
                 : 'border-transparent text-white/60 hover:text-white'
             }`}
           >
-            <FileCode className="w-3.5 h-3.5" />
+            <FileCode className="w-3.5 h-3.5 text-blue-400" />
             <span>Lua Code</span>
           </button>
           <button
             onClick={() => setActiveTab('output')}
-            className={`px-3.5 py-2 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
               activeTab === 'output'
                 ? 'border-purple-400 text-purple-300 bg-purple-900/20'
                 : 'border-transparent text-white/60 hover:text-white'
             }`}
           >
-            <Terminal className="w-3.5 h-3.5" />
-            <span>Console Output ({logs.length})</span>
+            <Terminal className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Script Output ({logs.length})</span>
           </button>
         </div>
 
         {/* Main Content Area */}
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex overflow-hidden relative">
           {activeTab === 'editor' ? (
-            <div className="flex-1 flex overflow-hidden font-mono text-xs">
+            <div className="flex-1 flex overflow-hidden font-mono text-xs relative">
               {/* Line Numbers Column */}
-              <div className="w-12 py-3 bg-[#110d1c] border-r border-white/5 select-none text-right pr-3 text-white/30 font-mono space-y-0 leading-6">
+              <div className="w-11 py-3 bg-[#110d1c] border-r border-white/5 select-none text-right pr-2.5 text-white/30 font-mono space-y-0 leading-6 shrink-0">
                 {lineNumbers.map((n) => (
                   <div key={n} className="h-6">
                     {n}
@@ -189,22 +275,49 @@ export default function StudioScriptEditor({
                 ))}
               </div>
 
-              {/* Code Textarea */}
+              {/* Code Textarea Area */}
               <div className="flex-1 relative bg-[#171126] p-3 overflow-auto">
                 <textarea
+                  ref={textareaRef}
                   value={code}
-                  onChange={(e) => setCode(e.target.value)}
+                  onChange={handleCodeChange}
                   spellCheck={false}
-                  placeholder="-- Write your Roblox Lua code here&#10;local part = script.Parent&#10;&#10;part.Touched:Connect(function(hit)&#10;    print('Touched!')&#10;end)"
-                  className="w-full h-full bg-transparent text-slate-100 focus:outline-none resize-none font-mono text-xs leading-6 selection:bg-purple-600/40"
+                  placeholder="-- Write your Roblox Lua script here&#10;local part = script.Parent&#10;&#10;part.Touched:Connect(function(hit)&#10;    print('Part touched!')&#10;end)"
+                  className="w-full h-full bg-transparent text-slate-100 focus:outline-none resize-none font-mono text-xs leading-6 selection:bg-purple-600/40 tracking-wide"
                   style={{ tabSize: 4 }}
                 />
+
+                {/* Intellisense Autocomplete Box */}
+                {showAutocomplete && matchingSuggestions.length > 0 && (
+                  <div className="absolute top-4 left-16 z-50 w-80 bg-[#1e1735] border border-purple-500/50 rounded-xl shadow-2xl p-1.5 overflow-hidden animate-fadeIn">
+                    <div className="px-2 py-1 text-[10px] font-bold text-purple-300 uppercase tracking-wider border-b border-white/10 flex items-center gap-1">
+                      <Zap className="w-3 h-3 text-amber-400" />
+                      <span>IntelliSense Suggestions</span>
+                    </div>
+                    <div className="max-h-48 overflow-y-auto space-y-0.5 mt-1">
+                      {matchingSuggestions.map((item, idx) => (
+                        <button
+                          key={item.label}
+                          onClick={() => handleSelectSuggestion(item.label)}
+                          className={`w-full text-left px-2 py-1.5 rounded-lg flex items-center justify-between text-xs transition-colors cursor-pointer ${
+                            idx === selectedIndex ? 'bg-purple-600 text-white font-bold' : 'hover:bg-purple-800/40 text-purple-200'
+                          }`}
+                        >
+                          <span className="font-mono text-xs">{item.label}</span>
+                          <span className="text-[9px] px-1 rounded bg-white/10 text-purple-200 font-sans">
+                            {item.type}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
             <div className="flex-1 flex flex-col bg-[#110d1c] p-4 overflow-hidden font-mono text-xs">
               <div className="flex items-center justify-between pb-2 border-b border-white/10 mb-2">
-                <span className="text-white/60 font-semibold">Studio Script Output:</span>
+                <span className="text-white/60 font-semibold">Studio Script Output Log:</span>
                 {onClearLogs && (
                   <button
                     onClick={onClearLogs}
@@ -219,7 +332,7 @@ export default function StudioScriptEditor({
               <div className="flex-1 overflow-auto space-y-1.5 scrollbar-thin">
                 {logs.length === 0 ? (
                   <div className="text-white/30 italic py-6 text-center">
-                    No output messages yet. Run playtest to execute scripts.
+                    No output messages yet. Run playtest (F5) to execute scripts and view live logs.
                   </div>
                 ) : (
                   logs.map((log) => (
@@ -251,14 +364,15 @@ export default function StudioScriptEditor({
         </div>
 
         {/* Bottom Status Bar */}
-        <div className="px-4 py-2 bg-[#120d20] border-t border-white/10 flex items-center justify-between text-[11px] text-white/50">
-          <div className="flex items-center gap-3">
+        <div className="px-3 py-1.5 bg-[#120d20] border-t border-white/10 flex items-center justify-between text-[10px] text-white/50 shrink-0 select-none">
+          <div className="flex items-center gap-3 font-mono">
             <span>Lines: {lineCount}</span>
-            <span>Language: Lua 5.1 / Luau</span>
+            <span>Luau 5.1</span>
+            <span>Auto-Save Enabled</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-400" />
-            <span className="text-emerald-400 font-semibold">Ready</span>
+            <span className="text-emerald-400 font-semibold">Editing {script.name}.lua</span>
           </div>
         </div>
       </div>
